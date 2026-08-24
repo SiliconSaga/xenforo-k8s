@@ -4,7 +4,6 @@
 # The security/caching rules here are adapted from XenForo's own MIT-licensed
 # Caddyfile in https://github.com/xenforo-ltd/cli — see ../NOTICE.md. TLS is
 # deliberately not handled: the cluster ingress (Traefik) terminates it.
-
 {
 	# Caddy would otherwise try to provision certificates for a bare hostname.
 	auto_https off

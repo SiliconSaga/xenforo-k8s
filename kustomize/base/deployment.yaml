@@ -36,6 +36,7 @@ spec:
               set -eu
               cp /opt/xenforo/Caddyfile /etc/caddy/Caddyfile
               mkdir -p /var/www/html/internal_data /var/www/html/data
+
               # config.php only has a home once the forum tree has been seeded.
               # Before that this is a no-op and the pod still starts, which is what
               # lets you seed the volume from a running pod. See docs/install.md.
@@ -44,6 +45,22 @@ spec:
               else
                 echo "XenForo source not present yet — skipping config.php install"
               fi
+
+              # `kubectl cp` writes as root, and fsGroup only fixes the volume root
+              # — not files created inside it afterwards. Without this, PHP (uid 82)
+              # cannot write attachments or its template cache, and the forum fails
+              # in ways that look like XenForo bugs rather than permissions.
+              #
+              # Only these three paths, not the whole tree: PHP having no write
+              # access to its own code is a feature, and a recursive chown over a
+              # volume full of attachments gets slow. src/addons is included because
+              # config.php enables the control-panel add-on installer, which unpacks
+              # there.
+              for d in internal_data data src/addons; do
+                if [ -d "/var/www/html/$d" ]; then
+                  chown -R 82:82 "/var/www/html/$d"
+                fi
+              done
           volumeMounts:
             - name: xf-data
               mountPath: /var/www/html
