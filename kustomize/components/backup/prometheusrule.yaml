@@ -1,0 +1,38 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: xenforo-backups
+  labels:
+    app.kubernetes.io/part-of: xenforo-k8s
+spec:
+  groups:
+    - name: xenforo-backups
+      rules:
+        # kube-state-metrics already publishes this — no exporter sidecar needed,
+        # unlike KubicValheim, whose backups are written by the game container
+        # rather than by a Job Kubernetes can see.
+        #
+        # 36h allows exactly one missed nightly run before complaining.
+        - alert: XenForoBackupStale
+          expr: time() - kube_cronjob_status_last_successful_time{cronjob="xenforo-db-backup"} > 129600
+          for: 30m
+          labels:
+            severity: warning
+            watched: "true"
+          annotations:
+            summary: "XenForo database backups have stalled in {{ $labels.namespace }}"
+            description: "No successful xenforo-db-backup run for over 36h. Check `kubectl -n {{ $labels.namespace }} get jobs -l app=xenforo-db-backup`."
+
+        # `absent()` catches the case the staleness rule structurally cannot: the
+        # CronJob has NEVER succeeded, so the metric does not exist and the
+        # comparison above is never evaluated. A backup alert that stays silent
+        # because backups never once worked is the exact failure it exists to catch.
+        - alert: XenForoBackupNeverRan
+          expr: absent(kube_cronjob_status_last_successful_time{cronjob="xenforo-db-backup"})
+          for: 6h
+          labels:
+            severity: critical
+            watched: "true"
+          annotations:
+            summary: "XenForo has NEVER completed a database backup"
+            description: "kube_cronjob_status_last_successful_time is absent for xenforo-db-backup. Either the CronJob has never succeeded, or it is not deployed in the namespace Prometheus is watching."

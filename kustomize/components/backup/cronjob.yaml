@@ -1,0 +1,94 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: xenforo-db-backup
+  labels:
+    app: xenforo-db-backup
+spec:
+  # 03:20 rather than 03:00 — every cluster's cron jobs pile up on the hour.
+  schedule: "20 3 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  # Without this a job that misses its window (node down, cluster asleep) is
+  # silently never rescheduled, and the freshness alert below is the only thing
+  # that would ever tell you.
+  startingDeadlineSeconds: 3600
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      template:
+        spec:
+          restartPolicy: OnFailure
+          securityContext:
+            fsGroup: 999
+          containers:
+            - name: mysqldump
+              image: mysql:8.4
+              command: ['sh', '-c']
+              args:
+                - |
+                  set -eu
+
+                  # A defaults file, not --password=. Anything on the command line
+                  # is visible in `ps` to every process in the container.
+                  umask 077
+                  cat > /tmp/my.cnf <<EOF
+                  [client]
+                  password=$(cat /run/secrets/xenforo/db-password)
+                  EOF
+
+                  TS="$(date +%Y-%m-%dT%H%M%SZ)"
+                  OUT="/backups/xenforo-${TS}.sql.gz"
+
+                  # --single-transaction gives a consistent snapshot without locking
+                  # the forum out; XenForo is InnoDB throughout so it is safe here.
+                  mysqldump \
+                    --defaults-extra-file=/tmp/my.cnf \
+                    --host="$XF_DB_HOST" \
+                    --port="$XF_DB_PORT" \
+                    --user="$XF_DB_USER" \
+                    --single-transaction \
+                    --quick \
+                    --default-character-set=utf8mb4 \
+                    "$XF_DB_DATABASE" | gzip -c > "$OUT.partial"
+
+                  # Only becomes a real backup once the dump completed. A truncated
+                  # .sql.gz that looks like a backup is worse than an obvious gap.
+                  mv "$OUT.partial" "$OUT"
+
+                  find /backups -name 'xenforo-*.sql.gz' -mtime +14 -delete
+                  find /backups -name '*.partial' -mtime +1 -delete
+
+                  echo "wrote $OUT ($(stat -c %s "$OUT") bytes)"
+              env:
+                - name: XF_DB_HOST
+                  value: xenforo-db
+                - name: XF_DB_PORT
+                  value: "3306"
+                - name: XF_DB_DATABASE
+                  value: xenforo
+                - name: XF_DB_USER
+                  value: xenforo
+              resources:
+                requests:
+                  cpu: 50m
+                  memory: 128Mi
+                limits:
+                  memory: 512Mi
+              volumeMounts:
+                - name: backups
+                  mountPath: /backups
+                - name: db-password
+                  mountPath: /run/secrets/xenforo
+                  readOnly: true
+          volumes:
+            - name: backups
+              persistentVolumeClaim:
+                claimName: xenforo-backups
+            - name: db-password
+              secret:
+                secretName: xenforo-secrets
+                items:
+                  - key: db-password
+                    path: db-password

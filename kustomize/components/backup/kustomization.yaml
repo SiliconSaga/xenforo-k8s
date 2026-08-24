@@ -1,0 +1,20 @@
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+
+# Nightly database dumps to a dedicated volume, plus the alerts that say whether
+# they are actually happening. READ THE README — this covers the database and not
+# the forum's uploaded files, and the copies never leave the cluster.
+#
+# The alerts live in this component rather than in observability/ so they cannot
+# exist in an overlay that has no backups for them to be stale about.
+resources:
+  - cronjob.yaml
+  - pvc.yaml
+  - prometheusrule.yaml
+
+# No includeSelectors here, unlike the other components: there is no Deployment or
+# Service in this set, and stamping a selector into a CronJob's jobTemplate fights
+# the auto-generated Job selector.
+labels:
+  - pairs:
+      app.kubernetes.io/part-of: xenforo-k8s

@@ -1,0 +1,22 @@
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: xenforo
+  labels:
+    # REQUIRED: heimdall's kube-prometheus-stack Prometheus selects ServiceMonitors
+    # by this release label. Without it the target is never scraped and nothing
+    # anywhere reports an error — it simply never appears.
+    release: heimdall-kube-prometheus
+    app.kubernetes.io/part-of: xenforo-k8s
+spec:
+  selector:
+    matchLabels:
+      app: xenforo
+      app.kubernetes.io/component: metrics
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: 30s
+  # No namespaceSelector: same-namespace selection, so this works in whatever
+  # namespace the overlay lands in. The ServiceMonitor and the xenforo-metrics
+  # Service are always co-located.

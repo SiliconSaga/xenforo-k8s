@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: xenforo-db
+  labels:
+    app: xenforo-db
+spec:
+  type: ClusterIP
+  selector:
+    app: xenforo-db
+  ports:
+    - name: mysql
+      port: 3306
+      targetPort: mysql
+      protocol: TCP

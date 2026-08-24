@@ -1,0 +1,27 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: xenforo
+
+resources:
+  # Namespace is included here (not in base) so flavor 2 boots with a bare
+  # `kubectl apply -k kustomize/overlays/plain` — zero extra steps. The gitops
+  # overlay omits it and relies on ArgoCD's CreateNamespace=true instead.
+  - namespace.yaml
+  - ../../base
+  - secret.yaml
+
+components:
+  - ../../components/db-throwaway
+
+patches:
+  # No ingress controller is assumed for the plain flavor — reach the forum with
+  # `kubectl port-forward svc/xenforo 8080:80` instead. The Ingress is left in
+  # place but pointed at a hostname that will not collide with anything real.
+  - target:
+      kind: Ingress
+      name: xenforo
+    patch: |-
+      - op: replace
+        path: /spec/rules/0/host
+        value: xenforo.localhost

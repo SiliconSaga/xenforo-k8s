@@ -1,0 +1,63 @@
+# Flavor 1 — plain Docker. Same image, same config.php, same Caddyfile as the
+# Kubernetes flavors; only the orchestration differs.
+#
+# You supply the XenForo source: unpack your licensed download into ./xf so that
+# ./xf/src/XF.php exists. See ../docs/install.md.
+
+services:
+  xenforo:
+    build:
+      context: ../image
+      args:
+        PHP_VERSION: ${PHP_VERSION:-8.4}
+        PHP_BUILD_IMAGICK: ${PHP_BUILD_IMAGICK:-0}
+        PHP_BUILD_REDIS: ${PHP_BUILD_REDIS:-0}
+    image: xenforo-k8s:local
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      XF_DB_HOST: db
+      XF_DB_PORT: "3306"
+      XF_DB_DATABASE: ${XF_DB_DATABASE:-xenforo}
+      XF_DB_USER: ${XF_DB_USER:-xenforo}
+      XF_DB_PASSWORD: ${XF_DB_PASSWORD:?set XF_DB_PASSWORD in .env}
+      XF_TITLE: ${XF_TITLE:-XenForo}
+      XF_COOKIE_PREFIX: ${XF_COOKIE_PREFIX:-xf_}
+      XF_DEBUG: ${XF_DEBUG:-}
+    volumes:
+      - ./xf:/var/www/html
+      # Mounted rather than copied by an init step, because compose has no init
+      # containers. Same file the image bakes for the Kubernetes flavors.
+      - ../image/config.php:/var/www/html/src/config.php:ro
+
+  caddy:
+    image: caddy:2.11-alpine
+    depends_on:
+      - xenforo
+    ports:
+      - "${HTTP_PORT:-8080}:8080"
+    volumes:
+      - ../image/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./xf:/var/www/html:ro
+
+  db:
+    image: mysql:8.4
+    command:
+      - --innodb-buffer-pool-size=256M
+      - --max-connections=64
+    environment:
+      MYSQL_DATABASE: ${XF_DB_DATABASE:-xenforo}
+      MYSQL_USER: ${XF_DB_USER:-xenforo}
+      MYSQL_PASSWORD: ${XF_DB_PASSWORD:?set XF_DB_PASSWORD in .env}
+      MYSQL_RANDOM_ROOT_PASSWORD: "1"
+    healthcheck:
+      test: ['CMD', 'mysqladmin', 'ping', '-h', '127.0.0.1']
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    volumes:
+      - db:/var/lib/mysql
+
+volumes:
+  db:

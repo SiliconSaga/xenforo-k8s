@@ -1,0 +1,70 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: xenforo-db
+  labels:
+    app: xenforo-db
+spec:
+  replicas: 1
+  strategy:
+    # Same reasoning as the forum pod: one RWO volume, so never two pods at once.
+    type: Recreate
+  selector:
+    matchLabels:
+      app: xenforo-db
+  template:
+    metadata:
+      labels:
+        app: xenforo-db
+    spec:
+      securityContext:
+        fsGroup: 999
+      containers:
+        - name: mysql
+          # MySQL, not MariaDB. XenForo runs on either, but matching the engine
+          # family that mimir's Percona composition vends keeps the eventual
+          # cutover to a claim boring — no dump/restore across engines.
+          image: mysql:8.4
+          args:
+            - --innodb-buffer-pool-size=256M
+            - --max-connections=64
+          resources:
+            requests:
+              cpu: 50m
+              memory: 512Mi
+            limits:
+              memory: 1Gi
+          env:
+            - name: MYSQL_DATABASE
+              value: xenforo
+            - name: MYSQL_USER
+              value: xenforo
+            - name: MYSQL_PASSWORD_FILE
+              value: /run/secrets/xenforo/db-password
+            - name: MYSQL_RANDOM_ROOT_PASSWORD
+              value: "1"
+          ports:
+            - name: mysql
+              containerPort: 3306
+              protocol: TCP
+          readinessProbe:
+            exec:
+              command: ['mysqladmin', 'ping', '-h', '127.0.0.1']
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          volumeMounts:
+            - name: db-data
+              mountPath: /var/lib/mysql
+            - name: db-password
+              mountPath: /run/secrets/xenforo
+              readOnly: true
+      volumes:
+        - name: db-data
+          persistentVolumeClaim:
+            claimName: xenforo-db-data
+        - name: db-password
+          secret:
+            secretName: xenforo-secrets
+            items:
+              - key: db-password
+                path: db-password

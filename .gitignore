@@ -1,0 +1,15 @@
+# Licensed XenForo source — MUST never be committed.
+docker/xf/
+xf/
+xenforo-*.zip
+xenforo-*/
+
+# Local environment
+.env
+.env.local
+
+# Database dumps
+*.sql
+*.sql.gz
+
+.DS_Store

@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: xenforo-data
+spec:
+  accessModes:
+    # ReadWriteOnce is sufficient and intentional — see the replica note in
+    # deployment.yaml. Longhorn (homelab) and PD (GKE) both provide it.
+    - ReadWriteOnce
+  resources:
+    requests:
+      # The XenForo tree is ~150MB; the rest is attachments and avatars. 10Gi is
+      # generous for a low-activity forum and cheap to expand later.
+      storage: 10Gi

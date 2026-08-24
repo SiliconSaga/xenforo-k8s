@@ -1,0 +1,17 @@
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+
+# Opt-in disposable database. See README.md in this directory before enabling it
+# for anything you care about.
+resources:
+  - deployment.yaml
+  - service.yaml
+  - pvc.yaml
+
+# base/'s label transformer only reaches base/'s own resources, so a component
+# has to stamp part-of itself or it goes missing from
+# `kubectl get all -l app.kubernetes.io/part-of=xenforo-k8s`.
+labels:
+  - pairs:
+      app.kubernetes.io/part-of: xenforo-k8s
+    includeSelectors: true

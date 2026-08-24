@@ -1,0 +1,21 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: xenforo
+  labels:
+    app: xenforo
+spec:
+  # Overlays patch both the class and the host. `traefik` is the SiliconSaga
+  # cluster default (nordri); the plain overlay is free to change it.
+  ingressClassName: traefik
+  rules:
+    - host: xenforo.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: xenforo
+                port:
+                  name: http

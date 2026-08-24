@@ -1,0 +1,40 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: xenforo
+
+resources:
+  - ../../base
+
+components:
+  - ../../components/observability
+  - ../../components/secrets-openbao
+  - ../../components/backup
+  # Still the disposable database. Drop this line and repoint XF_DB_HOST when a
+  # mimir Percona MySQL claim is available — see components/db-throwaway/README.md.
+  - ../../components/db-throwaway
+
+patches:
+  # Set the real hostname here. This is the one value that genuinely differs
+  # between a staging (homelab) and production (GKE) deployment of this overlay.
+  - target:
+      kind: Ingress
+      name: xenforo
+    patch: |-
+      - op: replace
+        path: /spec/rules/0/host
+        value: forum.siliconsaga.example
+
+  - patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: xenforo
+      spec:
+        template:
+          spec:
+            containers:
+              - name: php-fpm
+                env:
+                  - name: XF_TITLE
+                    value: SiliconSaga

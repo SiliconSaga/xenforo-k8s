@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: xenforo-backups
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      # 14 daily gzipped dumps of a low-activity forum. Grow this before the
+      # retention window in cronjob.yaml, not after.
+      storage: 5Gi

@@ -1,0 +1,16 @@
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+
+# Opt-in observability: scrape Caddy's metrics listener into heimdall's Prometheus,
+# and alert to a phone through heimdall's existing ntfy-watched route.
+#
+# What you get is HTTP-level (request counts, durations, status codes, in-flight
+# requests, handler errors) — enough to answer "is the forum serving and how fast".
+# PHP-FPM pool metrics and XenForo-internal metrics are NOT covered; they would need
+# a separate exporter sidecar.
+#
+# Backup alerting deliberately lives in components/backup rather than here, so the
+# alerts cannot exist in an overlay that has no backups to be stale.
+resources:
+  - servicemonitor.yaml
+  - prometheusrule.yaml

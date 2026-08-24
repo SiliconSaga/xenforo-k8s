@@ -1,0 +1,147 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: xenforo
+  labels:
+    app: xenforo
+spec:
+  # One replica, and deliberately so. The forum tree is a ReadWriteOnce volume that
+  # XenForo writes to at runtime (add-on installs, template cache, attachments), so
+  # a second replica would need RWX storage and a shared cache before it made sense.
+  replicas: 1
+  strategy:
+    # Recreate, not RollingUpdate: a rolling update would try to attach the same RWO
+    # volume to two pods at once and the new pod would sit Pending until the old one
+    # died anyway. Recreate makes that ordering explicit instead of accidental.
+    type: Recreate
+  selector:
+    matchLabels:
+      app: xenforo
+  template:
+    metadata:
+      labels:
+        app: xenforo
+    spec:
+      securityContext:
+        # 82 is www-data in the php:*-fpm-alpine images. fsGroup makes the mounted
+        # volume group-writable by that user, which is what lets XenForo write
+        # attachments and its template cache without running as root.
+        fsGroup: 82
+      initContainers:
+        - name: config-sync
+          image: ghcr.io/siliconsaga/xenforo-k8s:latest
+          command: ['sh', '-c']
+          args:
+            - |
+              set -eu
+              cp /opt/xenforo/Caddyfile /etc/caddy/Caddyfile
+              mkdir -p /var/www/html/internal_data /var/www/html/data
+              # config.php only has a home once the forum tree has been seeded.
+              # Before that this is a no-op and the pod still starts, which is what
+              # lets you seed the volume from a running pod. See docs/install.md.
+              if [ -d /var/www/html/src ]; then
+                cp /opt/xenforo/config.php /var/www/html/src/config.php
+              else
+                echo "XenForo source not present yet — skipping config.php install"
+              fi
+          volumeMounts:
+            - name: xf-data
+              mountPath: /var/www/html
+            - name: caddy-config
+              mountPath: /etc/caddy
+      containers:
+        - name: php-fpm
+          image: ghcr.io/siliconsaga/xenforo-k8s:latest
+          resources:
+            requests:
+              cpu: 50m
+              memory: 192Mi
+            limits:
+              memory: 512Mi
+          env:
+            - name: XF_DB_HOST
+              value: xenforo-db
+            - name: XF_DB_PORT
+              value: "3306"
+            - name: XF_DB_DATABASE
+              value: xenforo
+            - name: XF_DB_USER
+              value: xenforo
+            # The password is read from a mounted file rather than an env value, so
+            # it never appears in `kubectl describe pod`, phpinfo(), or a core dump.
+            - name: XF_DB_PASSWORD_FILE
+              value: /run/secrets/xenforo/db-password
+            - name: XF_TITLE
+              value: XenForo
+            - name: XF_COOKIE_PREFIX
+              value: xf_
+            - name: XF_MAIL_ENABLE
+              value: ""
+            - name: XF_DEBUG
+              value: ""
+          ports:
+            - name: fpm
+              containerPort: 9000
+              protocol: TCP
+          readinessProbe:
+            tcpSocket:
+              port: fpm
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: fpm
+            initialDelaySeconds: 15
+            periodSeconds: 30
+          volumeMounts:
+            - name: xf-data
+              mountPath: /var/www/html
+            - name: db-password
+              mountPath: /run/secrets/xenforo
+              readOnly: true
+        - name: caddy
+          image: caddy:2.11-alpine
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 128Mi
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+            - name: metrics
+              containerPort: 2020
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 30
+          volumeMounts:
+            - name: xf-data
+              mountPath: /var/www/html
+              readOnly: true
+            - name: caddy-config
+              mountPath: /etc/caddy
+              readOnly: true
+      volumes:
+        - name: xf-data
+          persistentVolumeClaim:
+            claimName: xenforo-data
+        - name: caddy-config
+          emptyDir: {}
+        - name: db-password
+          secret:
+            secretName: xenforo-secrets
+            items:
+              - key: db-password
+                path: db-password

@@ -1,0 +1,40 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: xenforo
+  labels:
+    app.kubernetes.io/part-of: xenforo-k8s
+spec:
+  groups:
+    - name: xenforo
+      rules:
+        # Scrape target down: pod gone, crashed, or unreachable. Scoped to the
+        # metrics Service by name so it cannot be broadened by accident later if a
+        # second port appears on it — KubicValheim learned that the hard way when a
+        # second endpoint on one Service made a bare up{} page for the wrong thing.
+        - alert: XenForoDown
+          expr: up{service="xenforo-metrics", endpoint="metrics"} == 0
+          for: 5m
+          labels:
+            severity: critical
+            # Routes to the ntfy-watched receiver -> heimdall-watched topic. This
+            # matcher already exists in heimdall's Alertmanager config; no
+            # Alertmanager change is needed to get a phone push.
+            watched: "true"
+          annotations:
+            summary: "XenForo in {{ $labels.namespace }} is DOWN"
+            description: "Caddy's metrics endpoint has been unreachable for 5m in namespace {{ $labels.namespace }}. The forum is not serving."
+
+        # Caddy counts a "request error" when a handler fails — for this pod that
+        # is overwhelmingly PHP-FPM refusing, timing out, or dying. It is the one
+        # signal that distinguishes "web tier up, forum broken" from "all fine",
+        # which up{} alone cannot see.
+        - alert: XenForoErrorRate
+          expr: sum(rate(caddy_http_request_errors_total[5m])) by (namespace) > 0.1
+          for: 10m
+          labels:
+            severity: warning
+            watched: "true"
+          annotations:
+            summary: "XenForo in {{ $labels.namespace }} is erroring"
+            description: "Caddy is reporting {{ $value | printf \"%.2f\" }} handler errors/sec over 10m. Usually PHP-FPM: check `kubectl logs deploy/xenforo -c php-fpm`."

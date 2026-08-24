@@ -1,0 +1,93 @@
+# Caddy front end for XenForo. Runs as a sidecar next to php-fpm in the same pod,
+# so PHP is reachable on 127.0.0.1:9000 and the forum tree is the same volume.
+#
+# The security/caching rules here are adapted from XenForo's own MIT-licensed
+# Caddyfile in https://github.com/xenforo-ltd/cli — see ../NOTICE.md. TLS is
+# deliberately not handled: the cluster ingress (Traefik) terminates it.
+
+{
+	# Caddy would otherwise try to provision certificates for a bare hostname.
+	auto_https off
+
+	# Keep the admin API on loopback. Metrics get their own listener below rather
+	# than exposing the full admin surface to the cluster.
+	admin 127.0.0.1:2019
+}
+
+:8080 {
+	root * /var/www/html
+	log
+
+	file_server
+	encode
+
+	header {
+		Content-Security-Policy "frame-ancestors 'none'"
+		Cross-Origin-Opener-Policy same-origin
+		Cross-Origin-Resource-Policy same-origin
+		Permissions-Policy "camera=(), geolocation=(), microphone=(), interest-cohort=()"
+		Referrer-Policy strict-origin-when-cross-origin
+		Server XenForo
+		X-Content-Type-Options nosniff
+
+		?Cache-Control no-store
+
+		-Via
+		-X-Powered-By
+	}
+
+	# Liveness/readiness target. Answered by Caddy directly so a probe never
+	# depends on PHP or the database being up — the probe is asking "is this pod
+	# serving?", and a DB outage should not restart the web tier.
+	handle /healthz {
+		respond "ok" 200
+	}
+
+	# Dotfiles stay hidden, but ACME/well-known must still resolve for anything
+	# the ingress forwards through.
+	@hidden {
+		path */.*
+		not path /.well-known/*
+	}
+	error @hidden 404
+
+	# XenForo's internals must never be web-reachable. internal_data holds session
+	# and template caches; cmd.php is the CLI entry point.
+	@internal {
+		path /internal_data/* /library/* /src/* /cmd.php /htaccess.txt
+	}
+	error @internal 404
+
+	@mutable {
+		file
+		path /favicon.ico
+	}
+	header @mutable Cache-Control "max-age=86400, stale-while-revalidate=3600"
+
+	# XenForo fingerprints these URLs, so they are safe to cache forever.
+	@immutable {
+		file
+		path /data/* /js/* /styles/*
+	}
+	header @immutable Cache-Control "max-age=31536000, immutable"
+
+	header /embed.php {
+		>Cross-Origin-Resource-Policy cross-origin
+		-Content-Security-Policy
+	}
+	header /js/xf/external_embed.js {
+		>Cache-Control "max-age=86400, stale-while-revalidate=3600"
+		>Cross-Origin-Resource-Policy cross-origin
+	}
+
+	# trusted_proxies lets XenForo see the real client IP through the ingress.
+	php_fastcgi 127.0.0.1:9000 {
+		trusted_proxies private_ranges
+	}
+}
+
+# Prometheus scrape target, separate from the app listener so it is never exposed
+# through the ingress and never inherits the app's headers.
+:2020 {
+	metrics /metrics
+}
