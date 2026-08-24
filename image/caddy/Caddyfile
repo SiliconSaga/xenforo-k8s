@@ -11,6 +11,18 @@
 	# Keep the admin API on loopback. Metrics get their own listener below rather
 	# than exposing the full admin surface to the cluster.
 	admin 127.0.0.1:2019
+
+	# REQUIRED for the caddy_http_* metric family to exist at all. Since Caddy 2.5
+	# per-request HTTP metrics are opt-in (they were made so over label-cardinality
+	# concerns), and without this the /metrics listener still answers — it just
+	# serves Go runtime and config stats and nothing about requests. That silence
+	# is the dangerous part: components/observability's XenForoErrorRate alert
+	# queries caddy_http_request_errors_total, and an alert whose metric never
+	# exists never fires and never complains. Verified by scraping a live pod.
+	#
+	# The global form, not the nested `servers { metrics }` — Caddy 2.11 warns that
+	# the nested option is deprecated and goes away in the next major.
+	metrics
 }
 
 :8080 {
