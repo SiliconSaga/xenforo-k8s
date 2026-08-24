@@ -5,36 +5,124 @@
 # mistakes, and component paths that moved.
 #
 # Usage: tests/render-all.sh          (or: ws test xenforo-k8s)
-#
-# Adapted from SiliconSaga/KubicValheim's tests/render-all.sh, with one change: that
-# script calls `kubectl kustomize`, which pins you to whatever kustomize is vendored
-# into your kubectl. `components:` needs kustomize >= 3.7 and `labels:` needs >= 4.x,
-# and an older kubectl (macOS Homebrew stragglers, some LTS distros) fails on both
-# with a bare `unknown field "components"` that reads like a manifest bug rather than
-# a tooling one.
-#
-# So the renderer is chosen by CAPABILITY, not by name: each candidate is probed
-# against a real overlay, and the first that can actually render this repo wins.
-# Version-string parsing would be worse — `kustomize version` has changed format
-# across releases, and what matters is whether it works, not what it calls itself.
+# Env:   KUSTOMIZE_BIN — path to a kustomize binary to prefer.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OVERLAYS_DIR="$ROOT/kustomize/overlays"
 
 shopt -s nullglob
-overlays=("$OVERLAYS_DIR"/*/)
-if (( ${#overlays[@]} == 0 )); then
+overlay_dirs=("$OVERLAYS_DIR"/*/)
+shopt -u nullglob
+
+if (( ${#overlay_dirs[@]} == 0 )); then
   echo "ERROR: no overlays found under $OVERLAYS_DIR" >&2
   exit 2
 fi
 
-# KUSTOMIZE_BIN is tried first so a machine whose system tooling is too old to
-# upgrade cheaply can point at a binary it unpacked somewhere else.
+stderr_file="$(mktemp)"
+fixture_dir=""
+cleanup() {
+  rm -f "$stderr_file"
+  if [[ -n "$fixture_dir" && -d "$fixture_dir" ]]; then
+    rm -rf "$fixture_dir"
+  fi
+}
+trap cleanup EXIT
+
+# --- Renderer selection ------------------------------------------------------
+# Pick the renderer by CAPABILITY, not by name. Hardcoding `kubectl kustomize`
+# pins this script to whatever kustomize is vendored inside whatever kubectl is on
+# PATH; an old kubectl (1.16.3 shipped kustomize 3.2.1) fails every overlay with
+# `json: unknown field "components"` — an error that reads like a manifest bug and
+# sends you hunting through YAML that is perfectly fine.
+#
+# Deliberately NOT parsing `kustomize version`: the format changed across releases
+# (v3 prints a `Version: {Version:3.2.1 ...}` struct, v5 prints a bare `v5.8.1`),
+# and what matters is whether it renders the features this repo uses.
+#
+# Probed against a tiny SYNTHETIC fixture, never against a real overlay. Probing a
+# real overlay conflates two questions: an overlay that is broken for its own
+# reasons and happens to sort first would make every candidate "fail", so the
+# script would blame the renderer ("too old") for what is actually one bad file —
+# and that overlay would never be reported as FAIL. The fixture exercises exactly
+# the two features that need a modern kustomize (`components:`, and `labels:` with
+# `includeSelectors`) and nothing else, so capability is answered independently of
+# repo state. Both of these — the fixture, and the array-based invocation below —
+# came back from SiliconSaga/KubicValheim, which had adapted the original idea
+# from this file and then hardened it.
+fixture_dir="$(mktemp -d)"
+mkdir -p "$fixture_dir/component"
+
+cat > "$fixture_dir/kustomization.yaml" <<'YAML'
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - configmap.yaml
+components:
+  - component
+labels:
+  - pairs:
+      probe: "true"
+    includeSelectors: true
+YAML
+
+cat > "$fixture_dir/configmap.yaml" <<'YAML'
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: probe
+data:
+  key: value
+YAML
+
+cat > "$fixture_dir/component/kustomization.yaml" <<'YAML'
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+resources:
+  - extra-configmap.yaml
+YAML
+
+cat > "$fixture_dir/component/extra-configmap.yaml" <<'YAML'
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: probe-extra
+data:
+  key: value
+YAML
+
+# Candidates are dispatched through a `case`, so each invocation builds its argv
+# with proper quoting. A candidate stored as a single string and invoked unquoted
+# word-splits on whitespace — a KUSTOMIZE_BIN path containing a space would be
+# silently torn apart. KubicValheim solves this with parallel arrays plus an eval
+# on a script-constructed variable name (bash cannot nest arrays); a case
+# statement gets the same safety with no eval at all, and works on the bash 3.2
+# that still ships with macOS.
+render_with() {
+  # $1 = candidate id, $2 = directory to build
+  case "$1" in
+    kustomize_bin) "$KUSTOMIZE_BIN" build "$2" ;;
+    kustomize)     kustomize build "$2" ;;
+    kubectl)       kubectl kustomize "$2" ;;
+    *)             echo "unknown renderer candidate: $1" >&2; return 2 ;;
+  esac
+}
+
+label_for() {
+  case "$1" in
+    kustomize_bin) printf '%s build (KUSTOMIZE_BIN)' "$KUSTOMIZE_BIN" ;;
+    kustomize)     printf 'kustomize build' ;;
+    kubectl)       printf 'kubectl kustomize' ;;
+  esac
+}
+
+# KUSTOMIZE_BIN first, so a machine whose system tooling is too old to upgrade
+# cheaply can point at a binary unpacked somewhere else.
 candidates=()
-[[ -n "${KUSTOMIZE_BIN:-}" ]] && candidates+=("$KUSTOMIZE_BIN build")
-command -v kustomize >/dev/null 2>&1 && candidates+=("kustomize build")
-command -v kubectl   >/dev/null 2>&1 && candidates+=("kubectl kustomize")
+[[ -n "${KUSTOMIZE_BIN:-}" ]] && candidates+=(kustomize_bin)
+command -v kustomize >/dev/null 2>&1 && candidates+=(kustomize)
+command -v kubectl   >/dev/null 2>&1 && candidates+=(kubectl)
 
 if (( ${#candidates[@]} == 0 )); then
   echo "ERROR: need either 'kustomize' or 'kubectl' on PATH (or KUSTOMIZE_BIN set)." >&2
@@ -44,19 +132,19 @@ fi
 probe_err=""
 renderer=""
 for candidate in "${candidates[@]}"; do
-  if err="$($candidate "${overlays[0]}" 2>&1 >/dev/null)"; then
+  if err="$(render_with "$candidate" "$fixture_dir" 2>&1 >/dev/null)"; then
     renderer="$candidate"
     break
   fi
-  # Keep the first real (non-capability) error to report if nothing works — if the
-  # manifests are genuinely broken, that message is more useful than "too old".
   [[ -z "$probe_err" ]] && probe_err="$err"
 done
 
 if [[ -z "$renderer" ]]; then
-  echo "ERROR: no available renderer could build ${overlays[0]}" >&2
+  echo "ERROR: no available renderer could build a minimal fixture using components: and labels:." >&2
   echo >&2
-  sed 's/^/    /' <<<"$probe_err" >&2
+  if [[ -n "$probe_err" ]]; then
+    sed 's/^/    /' <<<"$probe_err" >&2
+  fi
   if grep -qE 'unknown field "(components|labels)"' <<<"$probe_err"; then
     cat >&2 <<'EOF'
 
@@ -72,21 +160,19 @@ EOF
   exit 2
 fi
 
-echo "Renderer: $renderer"
+echo "Renderer: $(label_for "$renderer")"
 echo
+# --- End renderer selection ---------------------------------------------------
 
 pass=0
 fail=0
 
-stderr_file="$(mktemp)"
-trap 'rm -f "$stderr_file"' EXIT
-
 # Overlays are discovered rather than hardcoded, so a new one is covered the moment
 # it exists instead of the moment someone remembers to add it here.
-for overlay_dir in "${overlays[@]}"; do
+for overlay_dir in "${overlay_dirs[@]}"; do
   name="$(basename "$overlay_dir")"
 
-  if $renderer "$overlay_dir" >/dev/null 2>"$stderr_file"; then
+  if render_with "$renderer" "$overlay_dir" >/dev/null 2>"$stderr_file"; then
     echo "PASS: $name"
     pass=$((pass + 1))
     continue
