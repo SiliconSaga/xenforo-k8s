@@ -2,6 +2,16 @@
 
 Replaces [`db-throwaway`](../db-throwaway/README.md). Instead of running our own MySQL Deployment, this claims one from [mimir](https://github.com/SiliconSaga/mimir) and lets Crossplane and the Percona operator provision it.
 
+> ## ⚠️ This is mimir's *older* vending path
+>
+> This component uses the Crossplane `MySQLInstance` claim, which provisions **a whole PXC cluster dedicated to this app**. Mimir's `docs/plans/2026-08-17-dataservice-vending-design.md` names that pattern as the thing it is replacing — *"Explicitly not wanted: a cluster per app. That is the current behaviour and it costs ~4 pods per consumer."*
+>
+> The intended successor is mimir's own **`DataService`** operator (`mimir.siliconsaga.org/v1alpha1`): one namespaced resource that asks for a database *inside a shared cluster*, with the operator creating the database, the user, the grants, and the Secret.
+>
+> **We are not on it yet because it cannot serve MySQL today.** The `engine` enum accepts `mysql`, but `operator/cmd/main.go` registers only `engine.NewRegistry(engine.Postgres{})` — there is no `mysql.go` in `internal/engine/` — and `shared/kustomization.yaml` contains only `postgres-cluster.yaml`, so there is no shared MySQL cluster to vend out of either. A `DataService` with `engine: mysql` would pass admission and then fail to reconcile.
+>
+> When both land, migrating means replacing `claim.yaml` with a `DataService`, deleting `job-db-init.yaml` (the operator does that work), and pointing `XF_DB_HOST` at the shared cluster's endpoint. `patch-db-host.yaml` stays. Track it against that design doc.
+
 ```yaml
 components:
   - ../../components/db-mimir
@@ -33,6 +43,8 @@ Needed: Crossplane, `provider-kubernetes`, `function-go-templating`, `function-a
 ## Why the init Job exists
 
 The composition vends a PXC cluster with the operator's own users (`root`, `monitor`, `xtrabackup`, …) and **no application database**. Nothing upstream creates one, so XenForo would connect and find nothing. The Job closes that gap.
+
+This is the gap the `DataService` operator exists to close properly — `CREATE DATABASE`, `CREATE USER`, `GRANT`, write the Secret — so this Job is a hand-rolled stand-in for the MySQL provisioner that has not been written yet. It should be deleted, not ported, once that lands.
 
 It's idempotent (`CREATE ... IF NOT EXISTS`, `ALTER USER`) and annotated as an ArgoCD `PostSync` hook with `HookSucceeded` deletion, because a Job is immutable on re-apply and would otherwise fail every sync after a spec change. Under plain `kubectl` the annotations are inert.
 
