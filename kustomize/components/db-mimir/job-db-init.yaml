@@ -1,0 +1,72 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: xenforo-db-init
+  annotations:
+    # Under ArgoCD this runs after the claim exists and is cleaned up on success.
+    # Without the hook, a Job is immutable on re-apply and every sync after a spec
+    # change fails. Under plain kubectl the annotations are inert and it is just a Job.
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: HookSucceeded
+spec:
+  backoffLimit: 6
+  ttlSecondsAfterFinished: 3600
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: init
+          # Same image family as the cluster, so the client always matches the server.
+          image: percona/percona-xtradb-cluster:8.0.44-35.1
+          command: ['bash', '-c']
+          args:
+            - |
+              set -euo pipefail
+
+              # The composition vends a PXC cluster with the operator's own users
+              # (root, monitor, xtrabackup, ...) and NO application database. That
+              # gap is this Job: XenForo needs a database and a user, and nothing
+              # upstream creates them.
+              #
+              # backoffLimit is generous because the claim can report ready slightly
+              # before HAProxy accepts connections; retrying is cheaper than racing.
+              APP_PW="$(cat /run/secrets/app/db-password)"
+
+              # MYSQL_PWD (root) is injected from the operator-generated secret so it
+              # never appears in argv. Everything here is idempotent, which is what
+              # makes it safe as a PostSync hook that may run many times.
+              mysql -h "${XF_DB_HOST}" -u root <<SQL
+              CREATE DATABASE IF NOT EXISTS ${XF_DB_DATABASE}
+                CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci;
+              CREATE USER IF NOT EXISTS '${XF_DB_USER}'@'%' IDENTIFIED BY '${APP_PW}';
+              ALTER USER '${XF_DB_USER}'@'%' IDENTIFIED BY '${APP_PW}';
+              GRANT ALL PRIVILEGES ON ${XF_DB_DATABASE}.* TO '${XF_DB_USER}'@'%';
+              FLUSH PRIVILEGES;
+              SQL
+
+              echo "database ${XF_DB_DATABASE} and user ${XF_DB_USER} ready"
+          env:
+            - name: XF_DB_HOST
+              value: xenforo-mysql
+            - name: XF_DB_DATABASE
+              value: xenforo
+            - name: XF_DB_USER
+              value: xenforo
+            - name: MYSQL_PWD
+              valueFrom:
+                secretKeyRef:
+                  name: xenforo-mysql-secrets
+                  key: root
+          volumeMounts:
+            - name: app-secret
+              mountPath: /run/secrets/app
+              readOnly: true
+      volumes:
+        - name: app-secret
+          # The SAME secret the forum reads, so the password the Job sets and the
+          # password XenForo presents cannot drift apart.
+          secret:
+            secretName: xenforo-secrets
+            items:
+              - key: db-password
+                path: db-password

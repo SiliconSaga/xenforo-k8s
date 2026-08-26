@@ -1,0 +1,20 @@
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+
+# Opt-in: get the database from mimir's Crossplane composition instead of running
+# our own. Mutually exclusive with components/db-throwaway — enabling both leaves a
+# stray MySQL Deployment running that nothing points at.
+#
+# Requires a cluster where mimir is installed: Crossplane, provider-kubernetes,
+# function-go-templating, function-auto-ready, the Percona PXC operator, and the
+# xmysqls XRD + xmysql-percona Composition. `kubectl get xrd` is the quick check.
+resources:
+  - claim.yaml
+  - job-db-init.yaml
+
+patches:
+  - path: patch-db-host.yaml
+
+labels:
+  - pairs:
+      app.kubernetes.io/part-of: xenforo-k8s

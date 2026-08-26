@@ -10,8 +10,10 @@ components:
   - ../../components/observability
   - ../../components/secrets-openbao
   - ../../components/backup
-  # Still the disposable database. Drop this line and repoint XF_DB_HOST when a
-  # mimir Percona MySQL claim is available — see components/db-throwaway/README.md.
+  # Still the disposable database. The mimir-backed replacement is built and
+  # verified end-to-end (see components/db-mimir/README.md) — swap these two lines
+  # when the operator work has had the testing it still wants:
+  #   - ../../components/db-mimir
   - ../../components/db-throwaway
 
 patches:

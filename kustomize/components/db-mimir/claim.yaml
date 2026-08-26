@@ -1,0 +1,14 @@
+apiVersion: database.example.org/v1alpha1
+kind: MySQLInstance
+metadata:
+  name: xenforo-mysql
+spec:
+  parameters:
+    # replicas: 1 is deliberate and depends on the composition setting
+    # allowUnsafeConfigurations. A real PXC cluster is 3 nodes with Galera
+    # replication; one node is a single point of failure with no quorum. Correct
+    # for a low-activity forum where the backup CronJob is the recovery story,
+    # NOT correct if this forum ever matters enough to need availability.
+    replicas: 1
+    storageSize: 5Gi
+    version: "8.0"

@@ -36,7 +36,8 @@ kustomize/
   components/
     observability/           # ServiceMonitor against Caddy's metrics (opt-in)
     secrets-openbao/         # ExternalSecret for xenforo-secrets (opt-in)
-    db-throwaway/            # disposable MySQL 8.4, to be replaced by a mimir claim
+    db-throwaway/            # disposable MySQL 8.4 — self-contained, no prerequisites
+    db-mimir/                # database claimed from mimir's Crossplane composition
   overlays/
     plain/                   # Flavor 2: base + plain Secret + throwaway DB
     gitops/                  # Flavor 3: base + observability + secrets-openbao + DB
@@ -63,7 +64,12 @@ The database password reaches PHP as `XF_DB_PASSWORD_FILE` — a path to a mount
 
 ### Database
 
-`components/db-throwaway` is a single-pod MySQL 8.4 that exists so the forum runs end to end today. It is **not** backed up, replicated, or tuned. The destination is a mimir Percona MySQL claim; the component is MySQL rather than MariaDB specifically so that cutover is a dump and a hostname change. See [`kustomize/components/db-throwaway/README.md`](kustomize/components/db-throwaway/README.md).
+Two interchangeable components, and the pod spec is identical either way — only `XF_DB_HOST` differs, with the password still arriving through `XF_DB_PASSWORD_FILE` from the same secret.
+
+- [`db-throwaway`](kustomize/components/db-throwaway/README.md) — a single-pod MySQL 8.4 with no prerequisites, so the forum runs end to end on a bare cluster. Not backed up, replicated, or tuned.
+- [`db-mimir`](kustomize/components/db-mimir/README.md) — claims a Percona XtraDB cluster from [mimir](https://github.com/SiliconSaga/mimir)'s Crossplane composition. Needs Crossplane and the PXC operator on the cluster; verified end-to-end on Docker Desktop's Kubernetes.
+
+`db-throwaway` is MySQL rather than MariaDB specifically so the cutover between them is a dump and a hostname change rather than a cross-engine migration.
 
 ### Observability
 
