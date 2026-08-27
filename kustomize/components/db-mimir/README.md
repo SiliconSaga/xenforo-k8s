@@ -10,7 +10,11 @@ Replaces [`db-throwaway`](../db-throwaway/README.md). Instead of running our own
 >
 > **We are not on it yet because it cannot serve MySQL today.** The `engine` enum accepts `mysql`, but `operator/cmd/main.go` registers only `engine.NewRegistry(engine.Postgres{})` — there is no `mysql.go` in `internal/engine/` — and `shared/kustomization.yaml` contains only `postgres-cluster.yaml`, so there is no shared MySQL cluster to vend out of either. A `DataService` with `engine: mysql` would pass admission and then fail to reconcile.
 >
-> When both land, migrating means replacing `claim.yaml` with a `DataService`, deleting `job-db-init.yaml` (the operator does that work), and pointing `XF_DB_HOST` at the shared cluster's endpoint. `patch-db-host.yaml` stays. Track it against that design doc.
+> When both land, migrating means replacing `claim.yaml` with a `DataService`, deleting `job-db-init.yaml` (the operator does that work), and pointing `XF_DB_HOST` at the shared cluster's endpoint.
+>
+> **It is not only `XF_DB_HOST`, though** — verified by running the operator against this cluster on 2026-08-27. A `DataService` publishes its own Secret, named in `status.secretName`, with keys `host` / `port` / `database` / `username` / `password` / `uri`. This component instead reads `xenforo-secrets` with the single key `db-password`, and carries `XF_DB_USER` and `XF_DB_DATABASE` as literal env values. Those do not line up, so the swap needs a `db-dataservice` component that maps the published keys onto the env the pod expects — most of it via `secretKeyRef`, since `config.php` already resolves `XF_DB_PASSWORD_FILE` and the rest are plain values.
+>
+> Also worth knowing before wiring it: the operator **refuses** a `DataService` naming a database it did not create. A claim for `databaseName: xenforo` against the database this component's Job made reports `phase: Conflict` — "created outside the operator" — and leaves it untouched. That is the marker working, not a bug, but it means the migration is *new database plus a dump/restore*, never an in-place adoption.
 
 ```yaml
 components:
