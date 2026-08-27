@@ -21,9 +21,10 @@ if (( ${#overlay_dirs[@]} == 0 )); then
 fi
 
 stderr_file="$(mktemp)"
+probe_out="$(mktemp)"
 fixture_dir=""
 cleanup() {
-  rm -f "$stderr_file"
+  rm -f "$stderr_file" "$probe_out"
   if [[ -n "$fixture_dir" && -d "$fixture_dir" ]]; then
     rm -rf "$fixture_dir"
   fi
@@ -58,7 +59,8 @@ cat > "$fixture_dir/kustomization.yaml" <<'YAML'
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 resources:
-  - configmap.yaml
+  - deployment.yaml
+  - service.yaml
 components:
   - component
 labels:
@@ -67,13 +69,39 @@ labels:
     includeSelectors: true
 YAML
 
-cat > "$fixture_dir/configmap.yaml" <<'YAML'
-apiVersion: v1
-kind: ConfigMap
+# A Deployment and a Service, not just a ConfigMap — because `includeSelectors`
+# has nothing to prove against a resource with no selector. Returned from
+# KubicValheim, which spotted that the earlier fixture could not detect a
+# renderer that accepted `labels:` and silently ignored `includeSelectors`.
+cat > "$fixture_dir/deployment.yaml" <<'YAML'
+apiVersion: apps/v1
+kind: Deployment
 metadata:
   name: probe
-data:
-  key: value
+spec:
+  selector:
+    matchLabels:
+      app: probe
+  template:
+    metadata:
+      labels:
+        app: probe
+    spec:
+      containers:
+        - name: probe
+          image: probe:latest
+YAML
+
+cat > "$fixture_dir/service.yaml" <<'YAML'
+apiVersion: v1
+kind: Service
+metadata:
+  name: probe
+spec:
+  selector:
+    app: probe
+  ports:
+    - port: 80
 YAML
 
 cat > "$fixture_dir/component/kustomization.yaml" <<'YAML'
@@ -129,14 +157,44 @@ if (( ${#candidates[@]} == 0 )); then
   exit 2
 fi
 
+# The probe asserts on rendered OUTPUT, not on exit status.
+#
+# Exit status alone only proves the renderer did not choke on the syntax. A
+# renderer that parsed `labels:` and quietly ignored `includeSelectors` would
+# exit 0 and be selected as capable, and every overlay would then render with
+# selectors missing the part-of label — silently wrong rather than loudly
+# broken. Returned from KubicValheim, which hit exactly this reasoning.
+#
+# Two things are checked, one per feature:
+#   components:        the component's ConfigMap must appear at all
+#   includeSelectors:  the injected label must reach a real selector, which is
+#                      why the fixture carries a Deployment and a Service
 probe_err=""
 renderer=""
 for candidate in "${candidates[@]}"; do
-  if err="$(render_with "$candidate" "$fixture_dir" 2>&1 >/dev/null)"; then
-    renderer="$candidate"
-    break
+  if ! err="$(render_with "$candidate" "$fixture_dir" 2>&1 >"$probe_out")"; then
+    [[ -z "$probe_err" ]] && probe_err="$err"
+    continue
   fi
-  [[ -z "$probe_err" ]] && probe_err="$err"
+
+  if ! grep -q "name: probe-extra" "$probe_out"; then
+    [[ -z "$probe_err" ]] && probe_err="renderer exited 0 but the component's resource is missing — components: was ignored"
+    continue
+  fi
+  # -A3 rather than a bare grep: the label has to be inside the selector block,
+  # not merely somewhere in the document. It appears in metadata.labels too,
+  # which is what a bare match would find whether includeSelectors worked or not.
+  if ! grep -A3 'matchLabels:' "$probe_out" | grep -q 'probe: "true"'; then
+    [[ -z "$probe_err" ]] && probe_err="renderer exited 0 but the label never reached a selector — includeSelectors was ignored"
+    continue
+  fi
+  if ! grep -A3 '^  selector:' "$probe_out" | grep -q 'probe: "true"'; then
+    [[ -z "$probe_err" ]] && probe_err="renderer exited 0 but the Service selector was not stamped — includeSelectors was ignored"
+    continue
+  fi
+
+  renderer="$candidate"
+  break
 done
 
 if [[ -z "$renderer" ]]; then
