@@ -29,13 +29,21 @@ kubectl -n xenforo exec "${POD#pod/}" -c php-fpm -- \
   tar -cz -C /var/www/html data internal_data/attachments > xenforo-files-$(date +%F).tar.gz
 ```
 
-If the forum ever accumulates attachments worth automating, the honest fixes are RWX storage (Longhorn supports it) or a Velero schedule with a volume snapshot — not a CronJob that gambles on co-scheduling.
+If the forum ever accumulates attachments worth automating, the honest fixes are RWX storage or a Velero schedule with a volume snapshot — not a CronJob that gambles on co-scheduling.
+
+On RWX: Longhorn supports it on paper, but it was **retired from the homelab on 2026-08-26** having never successfully provisioned a volume there — and its validating webhook then wedged PVC admission cluster-wide, which is a worse failure than the gap it was meant to close. Whether it returns, or SeaweedFS replaces it, is open and tracked by nordri. Don't design around RWX yet. Velero is the nearer option — see below.
 
 ### Why on-cluster is not enough
 
 These dumps live on a PersistentVolume in the same cluster as the thing they are backing up. That covers the failure you will actually hit — a bad upgrade, a bad add-on, a deleted forum — and not the one that would hurt most: losing the cluster or the storage backend.
 
-The house pattern for the off-cluster leg is KubicValheim's: a scheduled job uploads to object storage and exports an upload-age metric, so the alert means *"backups left the cluster"* rather than *"a dump was written"*. That leg is not built here yet. Until it is, copy a dump off the cluster periodically and know that you are doing it by hand.
+There are two house answers, and they are complementary rather than alternatives.
+
+**Velero** (nordri, GKE) takes cluster-wide backups to GCS with persistent-disk snapshots. It is the net for losing the cluster, the namespace, or the PV. It is *not* a database backup: a snapshot of a live MySQL volume is crash-consistent, not transaction-consistent, so it recovers like a power cut. The dumps this component produces remain the thing you actually restore a forum from — Velero's job is to make sure the volume holding them still exists.
+
+**The KubicValheim upload pattern** is the per-app off-cluster leg: a scheduled job ships the artifact to object storage and touches a marker *only after a confirmed upload*, so the exported age metric means *"backups left the cluster"* rather than *"a dump was written"*. That distinction is not academic — the Valheim fleet ran for a long time with correct local backups, a correct alert, and nothing ever leaving the cluster.
+
+That leg is not built here yet. Until it is, copy a dump off the cluster periodically and know that you are doing it by hand.
 
 ## Restoring
 
