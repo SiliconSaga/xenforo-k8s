@@ -1,0 +1,50 @@
+# The same swap for the backup CronJob.
+#
+# Easy to miss, and it fails quietly: the CronJob carries its OWN copy of the
+# connection env and its own db-password volume, so patching only the
+# Deployment leaves the forum running against the vended database while the
+# nightly mysqldump still points at `xenforo-secrets` — a Secret that no longer
+# exists once components/secrets-openbao is dropped. The pod would go
+# CreateContainerConfigError at 03:20 and nowhere else.
+#
+# This patch is a no-op when components/backup is not enabled: kustomize
+# applies patches only to resources that exist in the build.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: xenforo-db-backup
+spec:
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          containers:
+            - name: mysqldump
+              env:
+                - name: XF_DB_HOST
+                  valueFrom:
+                    secretKeyRef:
+                      name: xenforo-db-dataservice
+                      key: host
+                - name: XF_DB_PORT
+                  valueFrom:
+                    secretKeyRef:
+                      name: xenforo-db-dataservice
+                      key: port
+                - name: XF_DB_DATABASE
+                  valueFrom:
+                    secretKeyRef:
+                      name: xenforo-db-dataservice
+                      key: database
+                - name: XF_DB_USER
+                  valueFrom:
+                    secretKeyRef:
+                      name: xenforo-db-dataservice
+                      key: username
+          volumes:
+            - name: db-password
+              secret:
+                secretName: xenforo-db-dataservice
+                items:
+                  - key: password
+                    path: db-password

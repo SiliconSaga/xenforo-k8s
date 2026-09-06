@@ -1,0 +1,52 @@
+# Point XenForo at the DataService secret instead of the base's hardcoded
+# values and the hand-managed `xenforo-secrets`.
+#
+# Every connection field is read from the secret rather than restated here.
+# The base hardcodes host/database/user because the throwaway database is
+# deployed alongside it with names it already knows; a vended database's
+# credentials are generated, so the secret is the only source of truth. Writing
+# them out again is how they drift.
+#
+# The password stays a MOUNTED FILE, not an env value — that is the base's
+# deliberate choice (it never appears in `kubectl describe pod`, phpinfo(), or
+# a core dump) and it survives this swap intact. Only the source secret and the
+# key name change: `xenforo-secrets/db-password` becomes
+# `xenforo-db-dataservice/password`, remapped back to the same mount path so
+# XF_DB_PASSWORD_FILE does not need to move.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: xenforo
+spec:
+  template:
+    spec:
+      containers:
+        - name: php-fpm
+          env:
+            - name: XF_DB_HOST
+              valueFrom:
+                secretKeyRef:
+                  name: xenforo-db-dataservice
+                  key: host
+            - name: XF_DB_PORT
+              valueFrom:
+                secretKeyRef:
+                  name: xenforo-db-dataservice
+                  key: port
+            - name: XF_DB_DATABASE
+              valueFrom:
+                secretKeyRef:
+                  name: xenforo-db-dataservice
+                  key: database
+            - name: XF_DB_USER
+              valueFrom:
+                secretKeyRef:
+                  name: xenforo-db-dataservice
+                  key: username
+      volumes:
+        - name: db-password
+          secret:
+            secretName: xenforo-db-dataservice
+            items:
+              - key: password
+                path: db-password
