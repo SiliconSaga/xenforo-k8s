@@ -22,15 +22,25 @@ components:
   # for one password and a seeding step before the forum could start.
 
 patches:
-  # Set the real hostname here. This is the one value that genuinely differs
-  # between a staging (homelab) and production (GKE) deployment of this overlay.
+  # Drop the base Ingress from this overlay entirely. httproute.yaml publishes
+  # forum.cmdbee.org through the traefik-gateway, and shipping both meant two
+  # objects claiming one hostname on the same controller — confirmed live, with
+  # the Ingress resolving to ingressClass traefik on 34.75.13.183, the very
+  # address the Gateway already answers on.
+  #
+  # Deleted rather than left unrouted: an Ingress with a stale host is the kind
+  # of thing that gets "fixed" later by pointing it somewhere, and then two
+  # routes disagree. The base keeps it for the plain and homelab flavors, which
+  # have no Gateway.
   - target:
       kind: Ingress
       name: xenforo
     patch: |-
-      - op: replace
-        path: /spec/rules/0/host
-        value: forum.cmdbee.org
+      apiVersion: networking.k8s.io/v1
+      kind: Ingress
+      metadata:
+        name: xenforo
+      $patch: delete
 
   - patch: |-
       apiVersion: apps/v1
