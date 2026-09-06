@@ -20,23 +20,31 @@ spec:
         spec:
           containers:
             - name: mysqldump
+              # See patch-db-connection.yaml for why `value: null` is required
+              # here: strategic merge matches env entries by name and keeps the
+              # base's literal value, and an entry carrying both `value` and
+              # `valueFrom` is rejected by the API server.
               env:
                 - name: XF_DB_HOST
+                  value: null
                   valueFrom:
                     secretKeyRef:
                       name: xenforo-db-dataservice
                       key: host
                 - name: XF_DB_PORT
+                  value: null
                   valueFrom:
                     secretKeyRef:
                       name: xenforo-db-dataservice
                       key: port
                 - name: XF_DB_DATABASE
+                  value: null
                   valueFrom:
                     secretKeyRef:
                       name: xenforo-db-dataservice
                       key: database
                 - name: XF_DB_USER
+                  value: null
                   valueFrom:
                     secretKeyRef:
                       name: xenforo-db-dataservice

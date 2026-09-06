@@ -22,23 +22,37 @@ spec:
     spec:
       containers:
         - name: php-fpm
+          # `value: null` is load-bearing, not noise. A strategic-merge patch
+          # merges env entries BY NAME, so without it the base's literal
+          # `value:` survives alongside the `valueFrom:` added here and the API
+          # server rejects the Deployment outright:
+          #   env[1].valueFrom: Invalid value: "": may not be specified when
+          #   `value` is not empty
+          # A null deletes the inherited field, leaving valueFrom alone. This
+          # does not show up in `kustomize build` as an error — the render is
+          # perfectly valid YAML carrying both keys — so it is only caught by
+          # applying, or by a server-side dry run.
           env:
             - name: XF_DB_HOST
+              value: null
               valueFrom:
                 secretKeyRef:
                   name: xenforo-db-dataservice
                   key: host
             - name: XF_DB_PORT
+              value: null
               valueFrom:
                 secretKeyRef:
                   name: xenforo-db-dataservice
                   key: port
             - name: XF_DB_DATABASE
+              value: null
               valueFrom:
                 secretKeyRef:
                   name: xenforo-db-dataservice
                   key: database
             - name: XF_DB_USER
+              value: null
               valueFrom:
                 secretKeyRef:
                   name: xenforo-db-dataservice
