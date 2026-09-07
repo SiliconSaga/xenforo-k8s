@@ -61,13 +61,13 @@ kubectl -n xenforo port-forward svc/xenforo 8080:80
 
 ### Changing the database password
 
-`overlays/plain/secret.yaml` has a placeholder committed to git so the overlay boots with no setup. Change it before the database is initialized — MySQL only reads `MYSQL_PASSWORD` on first start, so changing it after the fact means also changing it inside MySQL.
+`kustomize/overlays/plain/secret.yaml` has a placeholder committed to git so the overlay boots with no setup. Change it before the database is initialized — MySQL only reads `MYSQL_PASSWORD` on first start, so changing it after the fact means also changing it inside MySQL.
 
 ## Flavor 3 — GitOps
 
 The `gitops` overlay gets its database from mimir's shared MySQL via `db-dataservice`, so there is no secret to seed first. Before syncing:
 
-1. Set the real hostname in `overlays/gitops/httproute.yaml` (`spec.hostnames`). That is the only place it lives now — this overlay deletes the base `Ingress` rather than patching its host, so there is no second copy to keep in sync.
+1. Set the real hostname in `kustomize/overlays/gitops/httproute.yaml` (`spec.hostnames`). That is the only place it lives now — this overlay deletes the base `Ingress` rather than patching its host, so there is no second copy to keep in sync.
 2. Confirm mimir's shared MySQL is actually enabled: `shared/mysql-cluster.yaml` listed in `shared/kustomization.yaml`, and the `MIMIR_MYSQL_*` block uncommented in the operator deployment. With either missing the `DataService` reports `ClusterNotFound`.
 3. Check the `HTTPRoute` `parentRefs` match this cluster's Gateway — on SiliconSaga that is `traefik-gateway` in `kube-system`, listener `websecure`.
 
