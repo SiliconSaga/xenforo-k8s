@@ -110,7 +110,9 @@ gcloud projects add-iam-policy-binding teralivekubernetes \
   --member="user:THEIR@EMAIL" --role=roles/container.clusterViewer
 ```
 
-Apply the `minimal-access.yaml` RBAC resource, replacing the target email
+Apply the `minimal-access.yaml` RBAC resource, replacing the target email - `kubectl apply -f .\minimal-access.yaml -n xenforo`
+
+Then they run `gcloud container clusters get-credentials ttf-cluster --location us-east1-d --project teralivekubernetes`
 
 ## Credit
 
