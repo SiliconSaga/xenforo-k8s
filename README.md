@@ -6,7 +6,20 @@ A Kustomize-based [XenForo](https://xenforo.com) deployment that runs the **same
 
 ## One core, three flavors
 
-A single Kustomize `base/` (Deployment + Service + metrics Service + Ingress + PVC) is the one source of truth. Each platform extra is an additive Kustomize **component** (`observability`, `secrets-openbao`, `db-throwaway`); overlays compose them. The pod spec never changes between flavors — only the *source* of the `xenforo-secrets` Secret differs (a plain Secret in flavor 2, an ExternalSecret from OpenBAO in flavor 3).
+A single Kustomize `base/` (Deployment + Service + metrics Service + Ingress + PVC) is the one source of truth. Each platform extra is an additive Kustomize **component**; overlays compose them. The container images, volumes and probes are the same everywhere — what varies is where the database and its credentials come from, plus a small number of deliberate per-flavor patches (the GitOps overlay sets `XF_TITLE` and swaps the base `Ingress` for an `HTTPRoute`).
+
+| Component | What it adds |
+|---|---|
+| `observability` | ServiceMonitor + PrometheusRules against Caddy's metrics listener |
+| `backup` | nightly `mysqldump` CronJob to a separate PVC |
+| `db-throwaway` | a disposable MySQL Deployment beside the forum |
+| `db-dataservice` | a **database** vended from mimir's shared MySQL cluster |
+| `db-mimir` | a whole PXC **cluster** of its own, via a Crossplane `MySQLInstance` claim |
+| `secrets-openbao` | publishes `xenforo-secrets/db-password` from OpenBAO |
+
+The three `db-*` components are mutually exclusive — each sets the same connection fields, so enabling two leaves a database running that nothing points at. `db-dataservice` is the current recommendation: `db-mimir` provisions ~4 pods and ~1.3Gi for one app, and as of 2026-09-06 no `MySQLInstance` claim had ever existed on the SiliconSaga cluster, making it the *less*-travelled path despite being the older file.
+
+`secrets-openbao` is only needed alongside `db-throwaway` or `db-mimir`. `db-dataservice` generates and owns the credential itself, so pairing them would mean two sources for one password.
 
 ### Flavor 1 — Plain Docker
 
@@ -22,9 +35,13 @@ kubectl apply -k kustomize/overlays/plain
 
 Then seed the forum tree and run the installer — [`docs/install.md`](docs/install.md). Reach it with `kubectl -n xenforo port-forward svc/xenforo 8080:80`.
 
-### Flavor 3 — GitOps (ArgoCD + OpenBAO)
+### Flavor 3 — GitOps (ArgoCD + mimir DataService)
 
-`kustomize/overlays/gitops` (base + observability + secrets-openbao + db-throwaway) is deployed by an ArgoCD Application, with the database password sourced from OpenBAO via External Secrets, and Caddy's metrics scraped into heimdall's Prometheus. **Test through Git** — change flavor 3 by committing and syncing, never `kubectl edit` (selfHeal reverts it).
+`kustomize/overlays/gitops` (base + observability + backup + db-dataservice) with Caddy's metrics scraped into heimdall's Prometheus, an `HTTPRoute` publishing the forum through the shared traefik-gateway, and the database vended from mimir's shared MySQL cluster. The base `Ingress` is deleted in this overlay — shipping both meant two objects claiming one hostname on the same controller.
+
+**Test through Git** — change flavor 3 by committing and syncing, never `kubectl edit` (selfHeal reverts it).
+
+**Proven live on 2026-09-06** on the SiliconSaga GKE cluster: `forum.cmdbee.org`, XenForo 2.3.12, on the first database ever vended from mimir's shared MySQL. See [`docs/install.md`](docs/install.md) for the exact sequence that was run.
 
 ## Layout
 
@@ -34,13 +51,15 @@ docker/                      # Flavor 1: compose + env + README
 kustomize/
   base/                      # the shared core (one source of truth)
   components/
-    observability/           # ServiceMonitor against Caddy's metrics (opt-in)
+    observability/           # ServiceMonitor + PrometheusRules against Caddy's metrics (opt-in)
+    backup/                  # nightly mysqldump CronJob to its own PVC (opt-in)
     secrets-openbao/         # ExternalSecret for xenforo-secrets (opt-in)
     db-throwaway/            # disposable MySQL 8.4 — self-contained, no prerequisites
-    db-mimir/                # database claimed from mimir's Crossplane composition
+    db-dataservice/          # a DATABASE vended from mimir's shared MySQL cluster
+    db-mimir/                # a whole PXC CLUSTER, via a Crossplane MySQLInstance claim
   overlays/
     plain/                   # Flavor 2: base + plain Secret + throwaway DB
-    gitops/                  # Flavor 3: base + observability + secrets-openbao + DB
+    gitops/                  # Flavor 3: base + observability + backup + db-dataservice + HTTPRoute
 docs/
   install.md                 # seeding the forum tree, per flavor
   upgrades.md                # image vs XenForo, and how to do each
