@@ -28,7 +28,15 @@ spec:
               command: ['sh', '-c']
               args:
                 - |
-                  set -eu
+                  # `pipefail` is the load-bearing word here, not `-e`.
+                  #
+                  # The dump is a pipeline into gzip, and a shell reports only the
+                  # LAST command's status — so without this, mysqldump can die on
+                  # the first table and gzip still exits 0. The `mv` below then
+                  # promotes the stub to a real backup and the Job reports Success.
+                  # Observed on 2026-09-07: a privilege error produced a 375-byte
+                  # "backup" and a green Job.
+                  set -euo pipefail
 
                   # A defaults file, not --password=. Anything on the command line
                   # is visible in `ps` to every process in the container.
@@ -43,15 +51,53 @@ spec:
 
                   # --single-transaction gives a consistent snapshot without locking
                   # the forum out; XenForo is InnoDB throughout so it is safe here.
+                  #
+                  # The two extra flags exist because this runs as a
+                  # LEAST-PRIVILEGED user. A vended DataService tenant holds ALL
+                  # PRIVILEGES on its own database and only USAGE globally, so
+                  # every mysqldump default that reaches outside the schema fails.
+                  #
+                  # --set-gtid-purged=OFF is the one that matters, and the reason
+                  # is not obvious: on a GTID-enabled server (PXC always is)
+                  # mysqldump records @@GLOBAL.gtid_executed, and capturing that
+                  # consistently makes it issue `FLUSH /*!40101 LOCAL */ TABLES`,
+                  # which needs RELOAD. So it presents as a LOCKING error and no
+                  # amount of --skip-lock-tables / --lock-tables=false / --no-
+                  # tablespaces touches it — all four were measured failing on
+                  # 2026-09-07 against mysqldump 8.4.11. Turning off GTID capture
+                  # removes the flush and keeps --single-transaction intact.
+                  #
+                  # Losing GTIDs is correct here anyway: restoring one tenant's
+                  # dump into a shared cluster should never replay another
+                  # server's GTID history.
+                  #
+                  # --no-tablespaces avoids a separate PROCESS-privilege denial.
+                  #
+                  # ⚠ Verify any change to these flags with the mysql:8.4 client
+                  # BELOW, not with the mysqldump inside the PXC pod. Percona's
+                  # client accepts --single-transaction without the flush; the
+                  # Oracle 8.4 client does not, so testing server-side reports a
+                  # green result for a combination that fails in this Job.
                   mysqldump \
                     --defaults-extra-file=/tmp/my.cnf \
                     --host="$XF_DB_HOST" \
                     --port="$XF_DB_PORT" \
                     --user="$XF_DB_USER" \
                     --single-transaction \
+                    --set-gtid-purged=OFF \
+                    --no-tablespaces \
                     --quick \
                     --default-character-set=utf8mb4 \
                     "$XF_DB_DATABASE" | gzip -c > "$OUT.partial"
+
+                  # Belt to pipefail's braces. A gzip of nothing is ~20 bytes and a
+                  # gzip of an error message is a few hundred; a real XenForo dump
+                  # is megabytes. This catches a silent-success mode that exits 0.
+                  SIZE="$(stat -c %s "$OUT.partial")"
+                  if [ "$SIZE" -lt 10240 ]; then
+                    echo "ERROR: dump is only ${SIZE} bytes — refusing to publish it" >&2
+                    exit 1
+                  fi
 
                   # Only becomes a real backup once the dump completed. A truncated
                   # .sql.gz that looks like a backup is worse than an obvious gap.
