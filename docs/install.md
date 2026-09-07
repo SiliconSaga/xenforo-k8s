@@ -67,7 +67,7 @@ kubectl -n xenforo port-forward svc/xenforo 8080:80
 
 The `gitops` overlay gets its database from mimir's shared MySQL via `db-dataservice`, so there is no secret to seed first. Before syncing:
 
-1. Set the real hostname in `overlays/gitops/kustomization.yaml` **and** `overlays/gitops/httproute.yaml` — they are two files and must agree.
+1. Set the real hostname in `overlays/gitops/httproute.yaml` (`spec.hostnames`). That is the only place it lives now — this overlay deletes the base `Ingress` rather than patching its host, so there is no second copy to keep in sync.
 2. Confirm mimir's shared MySQL is actually enabled: `shared/mysql-cluster.yaml` listed in `shared/kustomization.yaml`, and the `MIMIR_MYSQL_*` block uncommented in the operator deployment. With either missing the `DataService` reports `ClusterNotFound`.
 3. Check the `HTTPRoute` `parentRefs` match this cluster's Gateway — on SiliconSaga that is `traefik-gateway` in `kube-system`, listener `websecure`.
 

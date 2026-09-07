@@ -90,12 +90,32 @@ spec:
                     --default-character-set=utf8mb4 \
                     "$XF_DB_DATABASE" | gzip -c > "$OUT.partial"
 
-                  # Belt to pipefail's braces. A gzip of nothing is ~20 bytes and a
-                  # gzip of an error message is a few hundred; a real XenForo dump
-                  # is megabytes. This catches a silent-success mode that exits 0.
-                  SIZE="$(stat -c %s "$OUT.partial")"
-                  if [ "$SIZE" -lt 10240 ]; then
-                    echo "ERROR: dump is only ${SIZE} bytes — refusing to publish it" >&2
+                  # Belt to pipefail's braces, in two parts. Deliberately NOT a
+                  # size floor: this Job can legitimately run before xf:install
+                  # has populated anything, and a valid dump of an empty database
+                  # is small. Size cannot distinguish that from a failure.
+                  #
+                  # gzip -t catches a truncated or corrupt archive — the pod
+                  # killed mid-write, the volume filling up.
+                  if ! gzip -t "$OUT.partial"; then
+                    echo "ERROR: archive is corrupt or truncated" >&2
+                    exit 1
+                  fi
+
+                  # ...but gzip -t is NOT sufficient on its own, which is the
+                  # whole reason this failure went unnoticed: the 375-byte file
+                  # that started all this was a perfectly VALID gzip — of an
+                  # error message. Integrity of the container says nothing about
+                  # completeness of the contents.
+                  #
+                  # mysqldump writes `-- Dump completed on <date>` as its last
+                  # line and only reaches it after every table is written, so the
+                  # marker means finished rather than merely well-formed. It is
+                  # present for an empty database too, which is what makes this
+                  # volume-independent. (Do not add --compact or --skip-comments
+                  # without changing this check — both suppress the footer.)
+                  if ! gzip -cd "$OUT.partial" | tail -5 | grep -q '^-- Dump completed'; then
+                    echo "ERROR: no completion marker — the dump did not finish" >&2
                     exit 1
                   fi
 
