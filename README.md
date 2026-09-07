@@ -100,6 +100,18 @@ Two interchangeable components, and the pod spec is identical either way — onl
 
 Pin a digest for anything you care about; see [`docs/upgrades.md`](docs/upgrades.md).
 
+## Adding Access
+
+To give another maintainer the minimally required access to Kubernetes to work with this setup:
+
+```bash
+# 1. IAM: lets them authenticate. Grants NO Kubernetes permissions by itself.
+gcloud projects add-iam-policy-binding teralivekubernetes \
+  --member="user:THEIR@EMAIL" --role=roles/container.clusterViewer
+```
+
+Apply the `minimal-access.yaml` RBAC resource, replacing the target email
+
 ## Credit
 
 The PHP extension set, the env-driven `config.php`, and the Caddyfile are adapted from XenForo Ltd.'s own MIT-licensed container tooling at [`xenforo-ltd/cli`](https://github.com/xenforo-ltd/cli). See [`image/NOTICE.md`](image/NOTICE.md).
