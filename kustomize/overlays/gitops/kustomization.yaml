@@ -10,28 +10,16 @@ resources:
 components:
   - ../../components/observability
   - ../../components/backup
-  # A vended database on mimir's shared MySQL cluster (2026-09-06), replacing
-  # the disposable one. NOT components/db-mimir: that files a MySQLInstance
-  # claim for a whole PXC cluster of its own, and no such claim has ever
-  # existed on this platform — the DataService is the path with a proven
-  # tenant behind it.
+  # A vended database, not db-mimir (which claims a whole PXC cluster of its own).
   - ../../components/db-dataservice
-  # components/secrets-openbao is deliberately gone with it. Its only job was
-  # to publish `xenforo-secrets/db-password` from OpenBAO; the DataService now
-  # generates and owns that credential, so keeping it would mean two sources
-  # for one password and a seeding step before the forum could start.
+  # secrets-openbao is deliberately gone with it: the DataService generates and
+  # owns the password, so keeping it would mean two sources for one credential.
 
 patches:
-  # Drop the base Ingress from this overlay entirely. httproute.yaml publishes
-  # forum.cmdbee.org through the traefik-gateway, and shipping both meant two
-  # objects claiming one hostname on the same controller — confirmed live, with
-  # the Ingress resolving to ingressClass traefik on 34.75.13.183, the very
-  # address the Gateway already answers on.
-  #
-  # Deleted rather than left unrouted: an Ingress with a stale host is the kind
-  # of thing that gets "fixed" later by pointing it somewhere, and then two
-  # routes disagree. The base keeps it for the plain and homelab flavors, which
-  # have no Gateway.
+  # Drop the base Ingress: httproute.yaml owns the hostname, and shipping both
+  # had two objects claiming it on the same controller. Deleted rather than left
+  # unrouted, so nobody later "fixes" it into a second conflicting route. The
+  # base keeps it for the plain and homelab flavors, which have no Gateway.
   - target:
       kind: Ingress
       name: xenforo

@@ -1,14 +1,8 @@
-# XenForo's database — a tenant on Mimir's shared MySQL cluster.
+# XenForo's database — a tenant on mimir's shared MySQL.
 #
-# One resource in XenForo's own namespace. No cluster, no storage class, no
-# replica count, no version: those are the platform's concerns, and stating
-# them here is what produced a cluster per app in the first place. Contrast
-# components/db-mimir/claim.yaml, which asks for replicas, storageSize and
-# version because it provisions a whole PXC cluster of its own.
-#
-# The operator creates the database and its owning user on the shared cluster
-# and publishes credentials to status.secretName — `xenforo-db-dataservice` —
-# with keys host, port, database, username, password and uri.
+# No cluster, storage class, replica count or version: those are the platform's
+# concerns, and naming them here is what produced a cluster per app. Credentials
+# land in `xenforo-db-dataservice` (host, port, database, username, password, uri).
 apiVersion: mimir.siliconsaga.org/v1alpha1
 kind: DataService
 metadata:

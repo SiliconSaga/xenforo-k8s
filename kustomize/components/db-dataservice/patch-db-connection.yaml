@@ -1,18 +1,11 @@
-# Point XenForo at the DataService secret instead of the base's hardcoded
-# values and the hand-managed `xenforo-secrets`.
+# Point XenForo at the DataService secret instead of the base's hardcoded values
+# and `xenforo-secrets`. A vended database's credentials are generated, so the
+# secret is the only source of truth — restating them here is how they drift.
 #
-# Every connection field is read from the secret rather than restated here.
-# The base hardcodes host/database/user because the throwaway database is
-# deployed alongside it with names it already knows; a vended database's
-# credentials are generated, so the secret is the only source of truth. Writing
-# them out again is how they drift.
-#
-# The password stays a MOUNTED FILE, not an env value — that is the base's
-# deliberate choice (it never appears in `kubectl describe pod`, phpinfo(), or
-# a core dump) and it survives this swap intact. Only the source secret and the
-# key name change: `xenforo-secrets/db-password` becomes
-# `xenforo-db-dataservice/password`, remapped back to the same mount path so
-# XF_DB_PASSWORD_FILE does not need to move.
+# The password stays a mounted FILE, keeping it out of `describe pod`, phpinfo()
+# and inherited child environments — not out of memory, since PHP reads it into
+# config. Only the source secret and key change, remapped to the same path so
+# XF_DB_PASSWORD_FILE need not move.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -22,16 +15,10 @@ spec:
     spec:
       containers:
         - name: php-fpm
-          # `value: null` is load-bearing, not noise. A strategic-merge patch
-          # merges env entries BY NAME, so without it the base's literal
-          # `value:` survives alongside the `valueFrom:` added here and the API
-          # server rejects the Deployment outright:
-          #   env[1].valueFrom: Invalid value: "": may not be specified when
-          #   `value` is not empty
-          # A null deletes the inherited field, leaving valueFrom alone. This
-          # does not show up in `kustomize build` as an error — the render is
-          # perfectly valid YAML carrying both keys — so it is only caught by
-          # applying, or by a server-side dry run.
+          # `value: null` is load-bearing: strategic merge matches env entries BY
+          # NAME, so without it the base's `value:` survives beside `valueFrom:`
+          # and the API server rejects the Deployment. `kustomize build` renders it
+          # happily — only an apply or server-side dry run catches it.
           env:
             - name: XF_DB_HOST
               value: null

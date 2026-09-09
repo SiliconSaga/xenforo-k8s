@@ -1,14 +1,9 @@
-# The same swap for the backup CronJob.
+# The same swap for the backup CronJob, which carries its OWN copy of the
+# connection env and db-password volume. Patching only the Deployment leaves the
+# forum working while the nightly mysqldump points at a Secret that no longer
+# exists — visible as CreateContainerConfigError at 03:20 and nowhere else.
 #
-# Easy to miss, and it fails quietly: the CronJob carries its OWN copy of the
-# connection env and its own db-password volume, so patching only the
-# Deployment leaves the forum running against the vended database while the
-# nightly mysqldump still points at `xenforo-secrets` — a Secret that no longer
-# exists once components/secrets-openbao is dropped. The pod would go
-# CreateContainerConfigError at 03:20 and nowhere else.
-#
-# This patch is a no-op when components/backup is not enabled: kustomize
-# applies patches only to resources that exist in the build.
+# No-op when components/backup is disabled: kustomize only patches what exists.
 apiVersion: batch/v1
 kind: CronJob
 metadata:
