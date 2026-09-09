@@ -118,17 +118,36 @@ RUN set -eux; \
 
 # --- PHP configuration ---------------------------------------------------------
 
+# memory_limit 512M, raised from 256M (2026-09-08): a migrated board exhausted
+# 256M on /forum/ and /login/keep-alive. One budget with pm.max_children below and
+# the container limit in kustomize/base/deployment.yaml — never change one alone.
+#
+# Comments stay outside the brace group: every line in it ends with a backslash,
+# and a `#` mid-continuation relies on the parser stripping it first.
 RUN set -eux; \
     cp "${PHP_INI_DIR}/php.ini-production" "${PHP_INI_DIR}/php.ini"; \
     { \
         echo "post_max_size=128M"; \
         echo "upload_max_filesize=128M"; \
-        echo "memory_limit=256M"; \
+        echo "memory_limit=512M"; \
         echo "expose_php=Off"; \
     } > "${PHP_INI_DIR}/conf.d/xenforo.ini";
 
 # php-fpm's default pool logs to a file and daemonizes access logging oddly under
 # Kubernetes. Send everything to stdout/stderr so `kubectl logs` is the whole story.
+#
+# pm.max_children 3, lowered from 10 (2026-09-08). It MULTIPLIES memory_limit:
+# 10 x 256M was 2.5G against a 512Mi limit, so the container was OOMKilled — no
+# error, no trace — before PHP could report anything. Looks fine at rest only
+# because start_servers is 2.
+#
+# 3 x 512M = 1.5G against 2Gi. That bounds PHP's userland allocator, not RSS:
+# shared opcache/JIT SHM, the master and native allocations sit on top, unmeasured
+# under load. Observed memory.peak was 371Mi under the old settings. Caddy is a
+# separate container with its own limit and does not draw on this.
+#
+# Low worker count suits a board that has always been lightly used, and Caddy
+# serves static assets without consuming one.
 RUN set -eux; \
     { \
         echo "[global]"; \
@@ -140,7 +159,7 @@ RUN set -eux; \
         echo "decorate_workers_output = no"; \
         echo "clear_env = no"; \
         echo "pm = dynamic"; \
-        echo "pm.max_children = 10"; \
+        echo "pm.max_children = 3"; \
         echo "pm.start_servers = 2"; \
         echo "pm.min_spare_servers = 1"; \
         echo "pm.max_spare_servers = 3"; \

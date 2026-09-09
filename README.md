@@ -79,7 +79,7 @@ The forum tree lives on a ReadWriteOnce PersistentVolume, because XenForo writes
 
 ### Secrets
 
-The database password reaches PHP as `XF_DB_PASSWORD_FILE` — a path to a mounted file, not an environment value. XenForo's `getenv_docker()` helper resolves the `_FILE` indirection. A secret in the environment leaks into `phpinfo()`, crash dumps, and every child process; a file mount does not.
+The database password reaches PHP as `XF_DB_PASSWORD_FILE` — a path to a mounted file, not an environment value. XenForo's `getenv_docker()` helper resolves the `_FILE` indirection. A secret in the environment leaks into `phpinfo()` and every child process; a file mount does not. It does not protect the value in memory — PHP reads it into config either way — so this narrows exposure rather than eliminating it.
 
 ### Database
 
@@ -113,6 +113,24 @@ gcloud projects add-iam-policy-binding teralivekubernetes \
 Apply the `minimal-access.yaml` RBAC resource, replacing the target email - `kubectl apply -f .\minimal-access.yaml -n xenforo`
 
 Then they run `gcloud container clusters get-credentials ttf-cluster --location us-east1-d --project teralivekubernetes`
+
+**The identity in the RoleBinding is case-sensitive; the one in the IAM command is not.** Google presents the capitalization the account was *registered* with, so `gcloud` accepts `first.last@example.com` while RBAC — an exact string compare — never matches an identity the API server reports as `First.Last@example.com`.
+
+Authentication still succeeds, which is what makes it confusing: they reach the cluster, and the binding simply never applies. Requests that depend on it return **Forbidden**, and `kubectl auth can-i get pods -n xenforo` answers `no`. Nothing points at the casing as the cause. Settle it with:
+
+```bash
+kubectl auth whoami
+```
+
+and copy the **`Username` value exactly as printed** into `minimal-access.yaml`, replacing `THEIR@EMAIL`. It is usually the email address, but paste what that command reports rather than retyping an address — the whole failure mode is a string that looks right and is not.
+
+**Do not diagnose this with `kubectl auth can-i --list`.** On this cluster it returns a near-empty table and warns `the list may be incomplete: webhook authorizer does not support user rule resolution`, so it looks identical whether access works or not. That depends on the authorizer a cluster is configured with rather than being true of GKE universally — but it is what you will see here. Test a concrete verb instead:
+
+```bash
+kubectl auth can-i get pods -n xenforo
+```
+
+**What `edit` actually grants is broader than it sounds.** Namespace-wide `edit` includes reading Secrets — convenient, since a maintainer can pull the database credentials themselves instead of being sent the live password out of band — and it permits deleting the PVCs that hold the forum. It also allows creating Pods with any ServiceAccount in the namespace, which means indirectly acquiring that ServiceAccount's API permissions. For a tighter grant, use `view` plus a narrow Role over just the one Secret.
 
 ## Credit
 

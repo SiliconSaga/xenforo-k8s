@@ -28,14 +28,9 @@ spec:
               command: ['sh', '-c']
               args:
                 - |
-                  # `pipefail` is the load-bearing word here, not `-e`.
-                  #
-                  # The dump is a pipeline into gzip, and a shell reports only the
-                  # LAST command's status — so without this, mysqldump can die on
-                  # the first table and gzip still exits 0. The `mv` below then
-                  # promotes the stub to a real backup and the Job reports Success.
-                  # Observed on 2026-09-07: a privilege error produced a 375-byte
-                  # "backup" and a green Job.
+                  # `pipefail`, not just `-e`: the dump pipes into gzip and a shell
+                  # reports only the last status, so mysqldump could die while gzip
+                  # exited 0 and `mv` published a 375-byte stub as a green backup.
                   set -euo pipefail
 
                   # A defaults file, not --password=. Anything on the command line
@@ -49,35 +44,22 @@ spec:
                   TS="$(date +%Y-%m-%dT%H%M%SZ)"
                   OUT="/backups/xenforo-${TS}.sql.gz"
 
-                  # --single-transaction gives a consistent snapshot without locking
-                  # the forum out; XenForo is InnoDB throughout so it is safe here.
+                  # --single-transaction: consistent snapshot, no lockout (InnoDB).
                   #
-                  # The two extra flags exist because this runs as a
-                  # LEAST-PRIVILEGED user. A vended DataService tenant holds ALL
-                  # PRIVILEGES on its own database and only USAGE globally, so
-                  # every mysqldump default that reaches outside the schema fails.
+                  # The other two exist because a vended DataService tenant has ALL
+                  # PRIVILEGES on its own schema and only USAGE globally, so every
+                  # mysqldump default reaching outside the schema fails.
+                  # --set-gtid-purged=OFF is the non-obvious one: recording
+                  # gtid_executed makes mysqldump FLUSH TABLES, which needs RELOAD,
+                  # so it presents as a LOCKING error that no lock-related flag
+                  # fixes. Dropping GTIDs is right anyway — one tenant's dump must
+                  # not replay another server's history. --no-tablespaces avoids a
+                  # separate PROCESS denial.
                   #
-                  # --set-gtid-purged=OFF is the one that matters, and the reason
-                  # is not obvious: on a GTID-enabled server (PXC always is)
-                  # mysqldump records @@GLOBAL.gtid_executed, and capturing that
-                  # consistently makes it issue `FLUSH /*!40101 LOCAL */ TABLES`,
-                  # which needs RELOAD. So it presents as a LOCKING error and no
-                  # amount of --skip-lock-tables / --lock-tables=false / --no-
-                  # tablespaces touches it — all four were measured failing on
-                  # 2026-09-07 against mysqldump 8.4.11. Turning off GTID capture
-                  # removes the flush and keeps --single-transaction intact.
-                  #
-                  # Losing GTIDs is correct here anyway: restoring one tenant's
-                  # dump into a shared cluster should never replay another
-                  # server's GTID history.
-                  #
-                  # --no-tablespaces avoids a separate PROCESS-privilege denial.
-                  #
-                  # ⚠ Verify any change to these flags with the mysql:8.4 client
-                  # BELOW, not with the mysqldump inside the PXC pod. Percona's
-                  # client accepts --single-transaction without the flush; the
-                  # Oracle 8.4 client does not, so testing server-side reports a
-                  # green result for a combination that fails in this Job.
+                  # ⚠ Test flag changes with the mysql:8.4 client below, NOT the
+                  # mysqldump in the PXC pod: Percona's accepts --single-transaction
+                  # without the flush, so server-side testing passes combinations
+                  # that fail here.
                   mysqldump \
                     --defaults-extra-file=/tmp/my.cnf \
                     --host="$XF_DB_HOST" \
@@ -90,30 +72,19 @@ spec:
                     --default-character-set=utf8mb4 \
                     "$XF_DB_DATABASE" | gzip -c > "$OUT.partial"
 
-                  # Belt to pipefail's braces, in two parts. Deliberately NOT a
-                  # size floor: this Job can legitimately run before xf:install
-                  # has populated anything, and a valid dump of an empty database
-                  # is small. Size cannot distinguish that from a failure.
-                  #
-                  # gzip -t catches a truncated or corrupt archive — the pod
-                  # killed mid-write, the volume filling up.
+                  # Two checks, not a size floor — this can legitimately run before
+                  # xf:install, and a valid empty-database dump is small.
+                  # gzip -t catches truncation (pod killed, volume full).
                   if ! gzip -t "$OUT.partial"; then
                     echo "ERROR: archive is corrupt or truncated" >&2
                     exit 1
                   fi
 
-                  # ...but gzip -t is NOT sufficient on its own, which is the
-                  # whole reason this failure went unnoticed: the 375-byte file
-                  # that started all this was a perfectly VALID gzip — of an
-                  # error message. Integrity of the container says nothing about
-                  # completeness of the contents.
-                  #
-                  # mysqldump writes `-- Dump completed on <date>` as its last
-                  # line and only reaches it after every table is written, so the
-                  # marker means finished rather than merely well-formed. It is
-                  # present for an empty database too, which is what makes this
-                  # volume-independent. (Do not add --compact or --skip-comments
-                  # without changing this check — both suppress the footer.)
+                  # gzip -t alone is not enough: the 375-byte file that started this
+                  # was valid gzip of an error message. mysqldump's `-- Dump
+                  # completed` footer is only reached after every table, and is
+                  # present for an empty database too. (--compact and
+                  # --skip-comments suppress it; change this check if you add them.)
                   if ! gzip -cd "$OUT.partial" | tail -5 | grep -q '^-- Dump completed'; then
                     echo "ERROR: no completion marker — the dump did not finish" >&2
                     exit 1

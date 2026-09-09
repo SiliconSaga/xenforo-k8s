@@ -69,12 +69,19 @@ spec:
       containers:
         - name: php-fpm
           image: ghcr.io/siliconsaga/xenforo-k8s:latest
+          # One budget with memory_limit and pm.max_children in image/Dockerfile —
+          # never change one alone: raising PHP's ceiling without this limit turns
+          # a clean PHP error into an opaque OOMKill.
+          #
+          # 3 workers x 512M = 1.5G against 2Gi. Request raised from 192Mi because
+          # measured idle was 252Mi, and a request under real idle usage gets the
+          # pod scheduled as small while it behaves large.
           resources:
             requests:
               cpu: 50m
-              memory: 192Mi
+              memory: 384Mi
             limits:
-              memory: 512Mi
+              memory: 2Gi
           env:
             - name: XF_DB_HOST
               value: xenforo-db
@@ -85,7 +92,7 @@ spec:
             - name: XF_DB_USER
               value: xenforo
             # The password is read from a mounted file rather than an env value, so
-            # it never appears in `kubectl describe pod`, phpinfo(), or a core dump.
+            # it stays out of `kubectl describe pod`, phpinfo() and child envs.
             - name: XF_DB_PASSWORD_FILE
               value: /run/secrets/xenforo/db-password
             - name: XF_TITLE

@@ -12,8 +12,9 @@
  * Every value supports the `<NAME>_FILE` indirection: set `XF_DB_PASSWORD_FILE`
  * to a path and the value is read from that file instead. That is how Kubernetes
  * secrets reach this config without ever becoming environment variables — a
- * secret in the environment leaks into `phpinfo()`, crash dumps, and any child
- * process, while a file mount does not.
+ * secret in the environment leaks into `phpinfo()` and any child process, while
+ * a file mount does not. Both end up in process memory once read, so this
+ * narrows exposure rather than eliminating it.
  */
 
 if (!function_exists('getenv_docker'))

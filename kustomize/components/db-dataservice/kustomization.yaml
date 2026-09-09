@@ -1,25 +1,13 @@
 apiVersion: kustomize.config.k8s.io/v1alpha1
 kind: Component
 
-# Opt-in: get a DATABASE from mimir's shared MySQL cluster, vended by the
-# DataService operator. Mutually exclusive with components/db-throwaway AND
-# with components/db-mimir — all three set the same connection fields, and
-# enabling two leaves a database running that nothing points at.
+# Opt-in: a DATABASE on mimir's shared MySQL, vended by the DataService operator.
+# Mutually exclusive with db-throwaway and db-mimir — all three set the same
+# connection fields. db-mimir instead claims a whole PXC cluster (~4 pods, 1.3Gi).
 #
-# How this differs from db-mimir, which is the older path: db-mimir files a
-# `MySQLInstance` Crossplane claim that provisions an ENTIRE PXC cluster for
-# this one app (~4 pods, ~1.3Gi). This asks for one database on a cluster the
-# platform already runs. As of 2026-09-06 no MySQLInstance claim has ever
-# existed on the SiliconSaga cluster, so db-mimir is the less-travelled path
-# despite being the older file.
-#
-# Requires: the mimir DataService operator with its MIMIR_MYSQL_* block
-# enabled, and shared/mysql-cluster.yaml listed in shared/kustomization.yaml.
-# Both were enabled together on 2026-09-06; with either missing the
-# DataService reports ClusterNotFound rather than failing at connect time.
-#
-# No job-db-init here, unlike db-mimir. The operator creates the database and
-# its owning user itself, so there is nothing left for an init Job to do.
+# Requires mimir's MIMIR_MYSQL_* block enabled and mysql-cluster.yaml listed in
+# its shared/kustomization.yaml, else the DataService reports ClusterNotFound.
+# No init Job needed: the operator creates the database and its owning user.
 resources:
   - dataservice.yaml
 
