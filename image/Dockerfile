@@ -29,6 +29,25 @@ ARG PHP_VERSION_IGBINARY=3.2.17RC1
 ARG PHP_VERSION_IMAGICK=3.8.1
 ARG PHP_VERSION_REDIS=6.3.0
 
+# --- Trust store -------------------------------------------------------------
+
+# Upgrade the system CA store explicitly rather than inheriting whatever the
+# php:*-fpm-alpine base happened to ship. The base is rebuilt on its own
+# cadence, so during the eMudhra CA compromise (2026-10-20, CVE-2026-111943)
+# this image was serving ca-certificates 20260909-r0 — one release behind
+# Alpine's 20261020-r0 fix — and a PHP outbound TLS connection accepted a
+# certificate chaining to a compromised intermediate. Pulling from Alpine's
+# repo at build time decouples us from the base's rebuild schedule.
+#
+# ⚠ This fixes PHP's OpenSSL/curl defaults ONLY. XenForo ships its OWN bundle at
+# src/XF/Http/ca-bundle.crt and wires it into Guzzle via XF\SubContainer\Http,
+# so XF's outbound HTTP ignores this store entirely. That file lives on the
+# forum volume, not in this image — refresh it with scripts/refresh-ca-bundle.sh
+# after every XenForo upgrade. See docs/upgrades.md.
+RUN set -eux; \
+    apk upgrade --no-cache ca-certificates ca-certificates-bundle; \
+    update-ca-certificates;
+
 # --- Required by XenForo -----------------------------------------------------
 
 RUN set -eux; \
