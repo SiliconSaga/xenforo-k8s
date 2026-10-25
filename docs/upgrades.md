@@ -73,9 +73,26 @@ Three consequences worth internalising:
 
 This stopped being theoretical on 2026-10-20. The eMudhra CA compromise (CVE-2026-111943) put eight recoverable intermediate CA keys in circulation, and the shipped bundle still trusted `emSign ECC Root CA - G3`, the root they cross-sign up to. Verified against the live pod: XF's bundle accepted a certificate chaining to a compromised intermediate while the same request through the system store also did. Two stores, two fixes.
 
-`scripts/refresh-ca-bundle.sh` installs the current [curl extract](https://curl.se/docs/caextract.html), which is what XenForo's own `ca-bundle-readme.txt` says to do, and regenerates `ca-bundle-legacy-openssl.crt` as bundle + `legacy-equifax.crt` (that variant exists so Google endpoints validate on OpenSSL older than 1.0.2). It backs up both files first, then proves the result two ways: the compromised test chain is rejected, **and** `xenforo.com` and `accounts.google.com` still validate — because a bundle that rejects everything would pass the first check alone.
+`scripts/refresh-ca-bundle.sh` installs the current [curl extract](https://curl.se/docs/caextract.html), which is what XenForo's own `ca-bundle-readme.txt` says to do, and regenerates `ca-bundle-legacy-openssl.crt` as bundle + `legacy-equifax.crt` (that variant exists so Google endpoints validate on OpenSSL older than 1.0.2).
 
-`scripts/refresh-ca-bundle.sh --check` reports without changing anything; it exits non-zero when the bundle is stale, so it suits a scheduled check.
+It validates the candidate **in the pod before anything live is overwritten**, and still backs both files up and rolls them back if a later step fails — a trust store left half-refreshed is a store nobody has verified, and the failure stays silent until an outbound request needs it. Each bundle is proven two ways: both compromised test chains are rejected, **and** `xenforo.com` and `accounts.google.com` still validate, because a bundle that rejects everything would pass the first check alone.
+
+Two negative-control hosts, not one, and they fail for different reasons. `dv-g3b-emudhra` serves an emSign chain, which dropping the emSign roots defeats. `dv-g3b-aaa-emudhra` is cross-signed up to Sectigo's legacy `AAA Certificate Services` root — a *legitimate* root, so where it is present no bundle refresh defeats that chain; only revocation checking or a library-level key denylist (Go 1.27.3's `crypto/x509`) does. It is absent from both the XenForo snapshot and the current curl extract, so both are rejected here. Measured on 2026-10-25:
+
+| bundle | `dv-g3b-emudhra` | `dv-g3b-aaa-emudhra` |
+| --- | --- | --- |
+| XenForo's shipped snapshot | `200 verify=0` — **accepted** | rejected (`verify=20`) |
+| current curl extract | rejected (`verify=20`) | rejected (`verify=20`) |
+
+If a future extract re-adds the AAA root, expect that probe to start failing for a reason no refresh can fix. That is a real signal, not a broken script.
+
+`scripts/refresh-ca-bundle.sh --check` reports without changing anything, so it suits a scheduled check. Exit codes are three-way on purpose: `0` clean, `1` stale, `2` no verdict. The last one matters — curl exits non-zero for DNS failure, blocked egress and timeouts just as it does for a rejected certificate, so collapsing those into "rejected" would report a vulnerable bundle as clean. Only exit 60 (`CURLE_PEER_FAILED_VERIFICATION`) counts as a rejection; alert on `2` as a problem with the probe, not with the bundle.
+
+### The image's store needs a bump too
+
+The other half is `image/Dockerfile`. Its trust-store `RUN` is deliberately the **last** layer: `apk --no-cache` tells apk not to keep an index, it tells BuildKit nothing, and CI exports a `type=gha,mode=max` cache — so higher up the file that layer would be served from cache on the weekly rebuild and never fetch a newer `ca-certificates`. Last, it can be invalidated cheaply instead of re-compiling every PHP extension under QEMU. CI passes a per-run `CA_REFRESH` and `pull: true`.
+
+`ARG CA_CERTIFICATES_MIN` asserts a floor afterwards, because "we ran `apk upgrade`" is not evidence that a fix landed. **Bump it at the next distrust event** — it is currently `20261020-r0`.
 
 Audit any other PEM the tree carries after an upgrade — `src/vendor/stripe/stripe-php/data/ca-certificates.crt` is a second bundled store, live only if Stripe payments are enabled:
 

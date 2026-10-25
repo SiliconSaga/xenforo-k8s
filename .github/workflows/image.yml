@@ -61,5 +61,15 @@ jobs:
         push: ${{ github.event_name != 'pull_request' }}
         tags: ${{ steps.meta.outputs.tags }}
         labels: ${{ steps.meta.outputs.labels }}
+        # Always re-resolve php:8.4-fpm-alpine. Without this a locally present
+        # base is reused, so the weekly run can rebuild against the same stale
+        # image it was scheduled to get away from.
+        pull: true
+        # Invalidates the trust-store layer (and only that layer — it is last in
+        # the Dockerfile) so every build re-queries Alpine for ca-certificates.
+        # The alternative is a cache hit that silently skips a CA fix, which is
+        # how the eMudhra-era image stayed on 20260909-r0.
+        build-args: |
+          CA_REFRESH=${{ github.run_id }}-${{ github.run_attempt }}
         cache-from: type=gha
         cache-to: type=gha,mode=max

@@ -29,25 +29,6 @@ ARG PHP_VERSION_IGBINARY=3.2.17RC1
 ARG PHP_VERSION_IMAGICK=3.8.1
 ARG PHP_VERSION_REDIS=6.3.0
 
-# --- Trust store -------------------------------------------------------------
-
-# Upgrade the system CA store explicitly rather than inheriting whatever the
-# php:*-fpm-alpine base happened to ship. The base is rebuilt on its own
-# cadence, so during the eMudhra CA compromise (2026-10-20, CVE-2026-111943)
-# this image was serving ca-certificates 20260909-r0 — one release behind
-# Alpine's 20261020-r0 fix — and a PHP outbound TLS connection accepted a
-# certificate chaining to a compromised intermediate. Pulling from Alpine's
-# repo at build time decouples us from the base's rebuild schedule.
-#
-# ⚠ This fixes PHP's OpenSSL/curl defaults ONLY. XenForo ships its OWN bundle at
-# src/XF/Http/ca-bundle.crt and wires it into Guzzle via XF\SubContainer\Http,
-# so XF's outbound HTTP ignores this store entirely. That file lives on the
-# forum volume, not in this image — refresh it with scripts/refresh-ca-bundle.sh
-# after every XenForo upgrade. See docs/upgrades.md.
-RUN set -eux; \
-    apk upgrade --no-cache ca-certificates ca-certificates-bundle; \
-    update-ca-certificates;
-
 # --- Required by XenForo -----------------------------------------------------
 
 RUN set -eux; \
@@ -191,6 +172,50 @@ RUN set -eux; \
 # indirection Kubernetes secret mounts rely on.
 COPY config.php /opt/xenforo/config.php
 COPY caddy/Caddyfile /opt/xenforo/Caddyfile
+
+# --- Trust store -------------------------------------------------------------
+
+# Upgrade the system CA store explicitly rather than inheriting whatever the
+# php:*-fpm-alpine base happened to ship. The base is rebuilt on its own
+# cadence, so during the eMudhra CA compromise (2026-10-20, CVE-2026-111943)
+# this image was serving ca-certificates 20260909-r0 — one release behind
+# Alpine's 20261020-r0 fix — and a PHP outbound TLS connection accepted a
+# certificate chaining to a compromised intermediate. Pulling from Alpine's
+# repo at build time decouples us from the base's rebuild schedule.
+#
+# ⚠ This fixes PHP's OpenSSL/curl defaults ONLY. XenForo ships its OWN bundle at
+# src/XF/Http/ca-bundle.crt and wires it into Guzzle via XF\SubContainer\Http,
+# so XF's outbound HTTP ignores this store entirely. That file lives on the
+# forum volume, not in this image — refresh it with scripts/refresh-ca-bundle.sh
+# after every XenForo upgrade. See docs/upgrades.md.
+#
+# LAST layer, and that placement is the point. `apk --no-cache` only stops apk
+# keeping an index on disk; it says nothing to BuildKit, and CI exports a
+# type=gha,mode=max cache. Sitting where it used to — above the extension
+# builds — this RUN would be served from cache on the weekly rebuild and never
+# fetch a newer ca-certificates, which is exactly the failure this block exists
+# to prevent. Down here, CA_REFRESH can invalidate it for pennies instead of
+# re-compiling every PHP extension under QEMU.
+#
+# CI passes a per-run CA_REFRESH value so every build genuinely re-queries
+# Alpine's repo (see .github/workflows/image.yml). A local `docker build`
+# without it caches normally, which is what you want while iterating.
+ARG CA_REFRESH=local
+# Floor assertion, because "we ran apk upgrade" is not evidence. If the mirror
+# is behind, or a cached layer somehow survives, the build fails here rather
+# than publishing an image whose trust store nobody checked. Bump this when the
+# next distrust event lands.
+ARG CA_CERTIFICATES_MIN=20261020-r0
+RUN set -eux; \
+    echo "CA refresh token: ${CA_REFRESH}"; \
+    apk upgrade --no-cache ca-certificates ca-certificates-bundle; \
+    update-ca-certificates; \
+    have="$(apk list --installed ca-certificates | head -n1 | cut -d' ' -f1 | sed 's/^ca-certificates-//')"; \
+    echo "ca-certificates installed: ${have} (floor ${CA_CERTIFICATES_MIN})"; \
+    if [ "$(apk version -t "${have}" "${CA_CERTIFICATES_MIN}")" = "<" ]; then \
+        echo "FATAL: ca-certificates ${have} is below the ${CA_CERTIFICATES_MIN} security floor" >&2; \
+        exit 1; \
+    fi;
 
 WORKDIR /var/www/html
 
