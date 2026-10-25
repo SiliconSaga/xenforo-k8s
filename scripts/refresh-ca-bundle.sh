@@ -74,6 +74,9 @@ KUBECTL=${KUBECTL:-kubectl}
 XFH=/var/www/html/src/XF/Http
 STAMP="$(date -u +%Y%m%d)"
 STAGE="/tmp/ca-refresh-$STAMP"
+# Per-run suffix for this attempt's undo copies. Distinct from .bak-$STAMP on
+# purpose — see the backup step for why one archival copy and one fresh copy.
+RB=".rollback-$$"
 
 POD="$("$KUBECTL" -n "$NS" get pod -l "$SELECTOR" -o jsonpath='{.items[0].metadata.name}')"
 [[ -n "$POD" ]] || { echo "no pod matched -l $SELECTOR in namespace $NS" >&2; exit 1; }
@@ -141,6 +144,31 @@ check_bundle() {
     done
 }
 
+# The mirror image of check_bundle: a host that MUST still validate, because a
+# bundle which rejects everything would sail through the negative controls.
+#
+# This reads the exit code too, rather than using `curl -f`. -f fails on any
+# HTTP error status, and xenforo.com answers a bare GET with 403 (Cloudflare
+# bot-blocking) while verifying perfectly — code=403, verify=0. So -f aborted
+# the run on a status that says nothing about TLS, and once rollback existed it
+# would have reverted a correct bundle for that reason. Exit 0 means the
+# handshake completed, which is the whole claim being made here.
+SAW_BAD=0
+expect_accept() {
+    local label="$1" path="$2" host="$3" verdict
+    verdict="$(probe "$path" "$host")"
+    case "$verdict" in
+        accepted)
+            echo "  ✓ $label validates $host" ;;
+        rejected)
+            echo "  ✗ $label FAILS to validate $host — it rejects legitimate TLS"
+            SAW_BAD=1 ;;
+        inconclusive:*)
+            echo "  ? $label vs $host: NO VERDICT (curl exit ${verdict#inconclusive:}) — cannot confirm legitimate TLS still works"
+            SAW_BAD=1 ;;
+    esac
+}
+
 echo "--- before ---"
 check_bundle ca-bundle.crt "$XFH/ca-bundle.crt"
 
@@ -166,13 +194,13 @@ fi
 BACKED_UP=0
 rollback() {
     [[ "$BACKED_UP" -eq 1 ]] || return 0
-    echo "--- restoring the originals from .bak-$STAMP ---" >&2
-    in_pod cp -a "$XFH/ca-bundle.crt.bak-$STAMP" "$XFH/ca-bundle.crt" \
-        || echo "  ! restore of ca-bundle.crt FAILED — the backup is still there, fix by hand" >&2
-    in_pod cp -a "$XFH/ca-bundle-legacy-openssl.crt.bak-$STAMP" "$XFH/ca-bundle-legacy-openssl.crt" \
-        || echo "  ! restore of ca-bundle-legacy-openssl.crt FAILED — the backup is still there, fix by hand" >&2
+    echo "--- restoring the bundles this run started with ---" >&2
+    in_pod cp -a "$XFH/ca-bundle.crt$RB" "$XFH/ca-bundle.crt" \
+        || echo "  ! restore of ca-bundle.crt FAILED — the copy is at $XFH/ca-bundle.crt$RB, fix by hand" >&2
+    in_pod cp -a "$XFH/ca-bundle-legacy-openssl.crt$RB" "$XFH/ca-bundle-legacy-openssl.crt" \
+        || echo "  ! restore of ca-bundle-legacy-openssl.crt FAILED — the copy is at $XFH/ca-bundle-legacy-openssl.crt$RB, fix by hand" >&2
     in_pod chmod 0644 "$XFH/ca-bundle.crt" "$XFH/ca-bundle-legacy-openssl.crt" || true
-    echo "  originals restored; backups left in place" >&2
+    echo "  restored; the $RB copies and any .bak-$STAMP are left in place" >&2
 }
 
 WORK="$(mktemp -d)"
@@ -185,7 +213,13 @@ cleanup() {
     local rc=$?
     rm -rf "$WORK"
     in_pod rm -rf "$STAGE" || true
-    [[ "$rc" -eq 0 ]] || rollback
+    if [[ "$rc" -eq 0 ]]; then
+        if [[ "$BACKED_UP" -eq 1 ]]; then
+            in_pod rm -f "$XFH/ca-bundle.crt$RB" "$XFH/ca-bundle-legacy-openssl.crt$RB" || true
+        fi
+    else
+        rollback
+    fi
 }
 trap cleanup EXIT
 
@@ -205,27 +239,37 @@ echo "--- validating the candidate in place (nothing live touched yet) ---"
 in_pod mkdir -p "$STAGE"
 "$KUBECTL" -n "$NS" cp "$WORK/cacert.pem" "$POD:$STAGE/ca-bundle.crt" -c "$CONTAINER"
 "$KUBECTL" -n "$NS" cp "$WORK/legacy.crt" "$POD:$STAGE/ca-bundle-legacy-openssl.crt" -c "$CONTAINER"
-SAW_ACCEPT=0; SAW_UNKNOWN=0
+SAW_ACCEPT=0; SAW_UNKNOWN=0; SAW_BAD=0
 check_bundle "candidate ca-bundle.crt" "$STAGE/ca-bundle.crt"
 check_bundle "candidate ca-bundle-legacy-openssl.crt" "$STAGE/ca-bundle-legacy-openssl.crt"
-if [[ "$SAW_ACCEPT" -eq 1 || "$SAW_UNKNOWN" -eq 1 ]]; then
+expect_accept "candidate ca-bundle.crt" "$STAGE/ca-bundle.crt" https://xenforo.com/
+expect_accept "candidate ca-bundle-legacy-openssl.crt" "$STAGE/ca-bundle-legacy-openssl.crt" https://accounts.google.com/
+if [[ "$SAW_ACCEPT" -eq 1 || "$SAW_UNKNOWN" -eq 1 || "$SAW_BAD" -eq 1 ]]; then
     echo "candidate did not pass — leaving the installed bundles untouched" >&2
     exit 1
 fi
-in_pod curl -fsS --max-time 20 --cacert "$STAGE/ca-bundle.crt" --capath /dev/null -o /dev/null https://xenforo.com/
-in_pod curl -fsS --max-time 20 --cacert "$STAGE/ca-bundle-legacy-openssl.crt" --capath /dev/null -o /dev/null https://accounts.google.com/
 echo "  ✓ candidate rejects both test chains and still validates legitimate TLS"
 
-echo "--- backing up current bundles (.bak-$STAMP) ---"
-# Never clobber a same-day backup: on a second run that would overwrite the
-# genuine pre-change original with the copy this script already installed, and
-# rollback would then restore the thing it was meant to undo.
+echo "--- backing up current bundles ---"
+# Two copies, because they answer two different questions.
+#
+# .bak-$STAMP is the dated archival copy and is never clobbered: on a second
+# run the same day, overwriting it would replace the genuine pre-change
+# original with the copy this script already installed.
+#
+# $RB is this attempt's undo and is therefore always fresh — rollback has to
+# restore the state immediately preceding THIS run, not whatever an earlier run
+# that day left behind. Removed on success.
 if in_pod test -e "$XFH/ca-bundle.crt.bak-$STAMP"; then
-    echo "  .bak-$STAMP already exists — keeping it as the rollback point"
+    echo "  .bak-$STAMP exists already — keeping it as the archival copy"
 else
     in_pod cp -a "$XFH/ca-bundle.crt" "$XFH/ca-bundle.crt.bak-$STAMP"
     in_pod cp -a "$XFH/ca-bundle-legacy-openssl.crt" "$XFH/ca-bundle-legacy-openssl.crt.bak-$STAMP"
+    echo "  archival copies written: *.bak-$STAMP"
 fi
+in_pod cp -a "$XFH/ca-bundle.crt" "$XFH/ca-bundle.crt$RB"
+in_pod cp -a "$XFH/ca-bundle-legacy-openssl.crt" "$XFH/ca-bundle-legacy-openssl.crt$RB"
+echo "  rollback copies written: *$RB"
 BACKED_UP=1
 
 echo "--- installing ---"
@@ -239,19 +283,16 @@ in_pod chmod 0644 "$XFH/ca-bundle.crt" "$XFH/ca-bundle-legacy-openssl.crt"
 # Re-check what is actually installed. The candidate passing is not the same
 # claim: a truncated copy would still have to be caught here.
 echo "--- after ---"
-SAW_ACCEPT=0; SAW_UNKNOWN=0
+SAW_ACCEPT=0; SAW_UNKNOWN=0; SAW_BAD=0
 check_bundle ca-bundle.crt "$XFH/ca-bundle.crt"
 check_bundle ca-bundle-legacy-openssl.crt "$XFH/ca-bundle-legacy-openssl.crt"
-if [[ "$SAW_ACCEPT" -eq 1 || "$SAW_UNKNOWN" -eq 1 ]]; then
+# A bundle that rejects everything would also "pass" the checks above, so prove
+# legitimate TLS still validates through each file before declaring success.
+expect_accept ca-bundle.crt "$XFH/ca-bundle.crt" https://xenforo.com/
+expect_accept ca-bundle-legacy-openssl.crt "$XFH/ca-bundle-legacy-openssl.crt" https://accounts.google.com/
+if [[ "$SAW_ACCEPT" -eq 1 || "$SAW_UNKNOWN" -eq 1 || "$SAW_BAD" -eq 1 ]]; then
     echo "installed bundles did not verify — rolling back" >&2
     exit 1
 fi
-
-# A bundle that rejects everything would also "pass" the test above, so prove
-# legitimate TLS still validates through each file before declaring success.
-in_pod curl -fsS --max-time 20 --cacert "$XFH/ca-bundle.crt" --capath /dev/null -o /dev/null https://xenforo.com/
-echo "  ✓ ca-bundle.crt still validates xenforo.com"
-in_pod curl -fsS --max-time 20 --cacert "$XFH/ca-bundle-legacy-openssl.crt" --capath /dev/null -o /dev/null https://accounts.google.com/
-echo "  ✓ ca-bundle-legacy-openssl.crt still validates accounts.google.com"
 
 echo "done. XenForo caches nothing here, so no rebuild or restart is required."
