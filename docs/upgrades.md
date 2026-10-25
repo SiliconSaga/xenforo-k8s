@@ -86,6 +86,10 @@ Two negative-control hosts, not one, and they fail for different reasons. `dv-g3
 
 If a future extract re-adds the AAA root, expect that probe to start failing for a reason no refresh can fix. That is a real signal, not a broken script.
 
+One more trap, and it bit: **`curl -f` is wrong for a TLS check.** `-f` fails on any HTTP error status, and `xenforo.com` answers a bare GET with `403` (Cloudflare bot-blocking) while verifying perfectly — `code=403 verify=0`. So the positive check aborted the run over a status that says nothing about TLS, and once rollback existed it would have reverted a *correct* bundle for that reason. Every probe now reads the exit code: `0` means the handshake completed, `60` means it was rejected, anything else means no verdict.
+
+Rollback restores a **fresh per-run copy**, not the dated `.bak-$STAMP`. The dated copy is archival and never clobbered, so a same-day re-run cannot overwrite the genuine pre-change original with the copy the script just installed; the per-run copy is what "undo this attempt" actually means, and it is removed on success.
+
 `scripts/refresh-ca-bundle.sh --check` reports without changing anything, so it suits a scheduled check. Exit codes are three-way on purpose: `0` clean, `1` stale, `2` no verdict. The last one matters — curl exits non-zero for DNS failure, blocked egress and timeouts just as it does for a rejected certificate, so collapsing those into "rejected" would report a vulnerable bundle as clean. Only exit 60 (`CURLE_PEER_FAILED_VERIFICATION`) counts as a rejection; alert on `2` as a problem with the probe, not with the bundle.
 
 ### The image's store needs a bump too
