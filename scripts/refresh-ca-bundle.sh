@@ -67,9 +67,21 @@ if ! in_pod test -f "$XFH/ca-bundle.crt"; then
     exit 1
 fi
 
+# ⚠ --capath /dev/null on every probe below, and it is load-bearing.
+#
+# Alpine's curl is built with a default CA *directory* of /etc/ssl/certs, and
+# --cacert overrides only the CA *file*. Without --capath the system store stays
+# in play, so a probe of XF's bundle silently measures "XF's bundle OR the
+# container's store" — and reports a clean bundle as still-vulnerable whenever
+# the image is the stale party. That happened on 2026-10-25: this script
+# installed a correct bundle and then failed its own verification, because the
+# pod was still running an image with ca-certificates 20260909-r0.
+#
+# Same class of error as grepping a nameless PEM bundle for "emSign". Pin BOTH
+# inputs or the measurement is meaningless.
 echo "--- before ---"
 echo -n "  emSign entries in XF bundle: "; in_pod grep -c emSign "$XFH/ca-bundle.crt" || true
-if in_pod curl -sS --cacert "$XFH/ca-bundle.crt" -o /dev/null "$TEST_HOST" 2>/dev/null; then
+if in_pod curl -sS --cacert "$XFH/ca-bundle.crt" --capath /dev/null -o /dev/null "$TEST_HOST" 2>/dev/null; then
     echo "  ⚠ XF bundle ACCEPTS the compromised test chain — refresh needed"
     STALE=1
 else
@@ -109,7 +121,7 @@ in_pod chmod 0644 "$XFH/ca-bundle.crt" "$XFH/ca-bundle-legacy-openssl.crt"
 echo "--- after ---"
 for f in ca-bundle.crt ca-bundle-legacy-openssl.crt; do
     echo -n "  emSign entries in $f: "; in_pod grep -c emSign "$XFH/$f" || true
-    if in_pod curl -sS --cacert "$XFH/$f" -o /dev/null "$TEST_HOST" 2>/dev/null; then
+    if in_pod curl -sS --cacert "$XFH/$f" --capath /dev/null -o /dev/null "$TEST_HOST" 2>/dev/null; then
         echo "  ✗ $f STILL ACCEPTS the compromised test chain"; exit 1
     else
         echo "  ✓ $f rejects the compromised test chain"
@@ -118,9 +130,9 @@ done
 
 # A bundle that rejects everything would also "pass" the test above, so prove
 # legitimate TLS still validates through each file before declaring success.
-in_pod curl -fsS --cacert "$XFH/ca-bundle.crt" -o /dev/null https://xenforo.com/
+in_pod curl -fsS --cacert "$XFH/ca-bundle.crt" --capath /dev/null -o /dev/null https://xenforo.com/
 echo "  ✓ ca-bundle.crt still validates xenforo.com"
-in_pod curl -fsS --cacert "$XFH/ca-bundle-legacy-openssl.crt" -o /dev/null https://accounts.google.com/
+in_pod curl -fsS --cacert "$XFH/ca-bundle-legacy-openssl.crt" --capath /dev/null -o /dev/null https://accounts.google.com/
 echo "  ✓ ca-bundle-legacy-openssl.crt still validates accounts.google.com"
 
 echo "done. XenForo caches nothing here, so no rebuild or restart is required."
