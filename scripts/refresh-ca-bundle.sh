@@ -81,7 +81,11 @@ STAMP="$(date -u +%Y%m%d)"
 # genuinely shared writes left are the final renames, where both runs install
 # byte-identical content from the same upstream extract.
 RUN_ID="$$"
-STAGE="/tmp/ca-refresh-$STAMP.$RUN_ID"
+# Set by mktemp INSIDE the pod, not derived from the local PID — a PID on this
+# machine reserves nothing in the container, and `mkdir -p` would happily adopt
+# a directory another run already owns. Empty until that succeeds, so cleanup
+# knows there is nothing to remove.
+STAGE=
 # Per-run suffix for this attempt's undo copies. Distinct from .bak-$STAMP on
 # purpose — see the backup step for why one archival copy and one fresh copy.
 RB=".rollback-$RUN_ID"
@@ -224,7 +228,9 @@ WORK="$(mktemp -d)"
 cleanup() {
     local rc=$?
     rm -rf "$WORK"
-    in_pod rm -rf "$STAGE" || true
+    if [[ -n "$STAGE" ]]; then
+        in_pod rm -rf "$STAGE" || true
+    fi
     # Any .partial is a copy that did not finish, so it is never useful.
     in_pod rm -f "$XFH/ca-bundle.crt$RB.partial-$RUN_ID" \
                  "$XFH/ca-bundle-legacy-openssl.crt$RB.partial-$RUN_ID" \
@@ -253,7 +259,8 @@ cat "$WORK/cacert.pem" "$WORK/legacy-equifax.crt" > "$WORK/legacy.crt"
 # Prove the candidate in the pod BEFORE it replaces anything live. Rollback is
 # the safety net; not needing it is better.
 echo "--- validating the candidate in place (nothing live touched yet) ---"
-in_pod mkdir -p "$STAGE"
+STAGE="$(in_pod mktemp -d "/tmp/ca-refresh-$STAMP.XXXXXX")"
+[[ -n "$STAGE" ]] || { echo "could not create a staging directory in the pod" >&2; exit 1; }
 "$KUBECTL" -n "$NS" cp "$WORK/cacert.pem" "$POD:$STAGE/ca-bundle.crt" -c "$CONTAINER"
 "$KUBECTL" -n "$NS" cp "$WORK/legacy.crt" "$POD:$STAGE/ca-bundle-legacy-openssl.crt" -c "$CONTAINER"
 SAW_ACCEPT=0; SAW_UNKNOWN=0; SAW_BAD=0
