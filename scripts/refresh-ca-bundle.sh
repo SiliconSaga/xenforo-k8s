@@ -85,7 +85,10 @@ echo "pod: $NS/$POD ($CONTAINER)"
 in_pod() { "$KUBECTL" -n "$NS" exec "$POD" -c "$CONTAINER" -- "$@"; }
 
 # A pre-seed pod has no forum tree yet; say so rather than failing obscurely.
-if ! in_pod test -f "$XFH/ca-bundle.crt"; then
+# stderr is dropped on these existence tests: kubectl prints "command
+# terminated with exit code 1" whenever the remote command exits non-zero, so a
+# simple "this file is absent" answer looked like a failure in the run log.
+if ! in_pod test -f "$XFH/ca-bundle.crt" 2>/dev/null; then
     echo "XenForo source not present yet ($XFH/ca-bundle.crt missing) — install the forum tree first." >&2
     exit 1
 fi
@@ -199,6 +202,7 @@ rollback() {
         || echo "  ! restore of ca-bundle.crt FAILED — the copy is at $XFH/ca-bundle.crt$RB, fix by hand" >&2
     in_pod cp -a "$XFH/ca-bundle-legacy-openssl.crt$RB" "$XFH/ca-bundle-legacy-openssl.crt" \
         || echo "  ! restore of ca-bundle-legacy-openssl.crt FAILED — the copy is at $XFH/ca-bundle-legacy-openssl.crt$RB, fix by hand" >&2
+    in_pod chown root:www-data "$XFH/ca-bundle.crt" "$XFH/ca-bundle-legacy-openssl.crt" || true
     in_pod chmod 0644 "$XFH/ca-bundle.crt" "$XFH/ca-bundle-legacy-openssl.crt" || true
     echo "  restored; the $RB copies and any .bak-$STAMP are left in place" >&2
 }
@@ -260,13 +264,19 @@ echo "--- backing up current bundles ---"
 # $RB is this attempt's undo and is therefore always fresh — rollback has to
 # restore the state immediately preceding THIS run, not whatever an earlier run
 # that day left behind. Removed on success.
-if in_pod test -e "$XFH/ca-bundle.crt.bak-$STAMP"; then
-    echo "  .bak-$STAMP exists already — keeping it as the archival copy"
-else
-    in_pod cp -a "$XFH/ca-bundle.crt" "$XFH/ca-bundle.crt.bak-$STAMP"
-    in_pod cp -a "$XFH/ca-bundle-legacy-openssl.crt" "$XFH/ca-bundle-legacy-openssl.crt.bak-$STAMP"
-    echo "  archival copies written: *.bak-$STAMP"
-fi
+#
+# Each file is tested on its own. One file's dated copy is not evidence for the
+# other's: if the first cp succeeded and the second failed, a retry that keyed
+# off a single sentinel would skip both, leave the legacy bundle with no
+# archival copy, and then delete the rollback copies on success.
+for f in ca-bundle.crt ca-bundle-legacy-openssl.crt; do
+    if in_pod test -e "$XFH/$f.bak-$STAMP" 2>/dev/null; then
+        echo "  $f.bak-$STAMP exists already — keeping it as the archival copy"
+    else
+        in_pod cp -a "$XFH/$f" "$XFH/$f.bak-$STAMP"
+        echo "  archival copy written: $f.bak-$STAMP"
+    fi
+done
 in_pod cp -a "$XFH/ca-bundle.crt" "$XFH/ca-bundle.crt$RB"
 in_pod cp -a "$XFH/ca-bundle-legacy-openssl.crt" "$XFH/ca-bundle-legacy-openssl.crt$RB"
 echo "  rollback copies written: *$RB"
@@ -276,8 +286,16 @@ echo "--- installing ---"
 in_pod cp -a "$STAGE/ca-bundle.crt" "$XFH/ca-bundle.crt"
 in_pod cp -a "$STAGE/ca-bundle-legacy-openssl.crt" "$XFH/ca-bundle-legacy-openssl.crt"
 
-# cp lands files as root, which is what the rest of src/ is: PHP deliberately
-# has no write access to its own code. Only mode needs restating.
+# Ownership has to be restated, not just mode. `kubectl cp` preserves the
+# LOCAL uid/gid of whoever ran this script, so the first real run landed both
+# bundles as 502:dialout — my macOS uid, meaningless inside the container —
+# where the rest of src/ is root:www-data. It still worked, because 0644 leaves
+# them world-readable and PHP only needs to read them, which is exactly why
+# this would have sat there unnoticed.
+#
+# Mode stays 0644 rather than the 0664 its siblings carry: nothing should be
+# writing a trust store at runtime.
+in_pod chown root:www-data "$XFH/ca-bundle.crt" "$XFH/ca-bundle-legacy-openssl.crt"
 in_pod chmod 0644 "$XFH/ca-bundle.crt" "$XFH/ca-bundle-legacy-openssl.crt"
 
 # Re-check what is actually installed. The candidate passing is not the same
