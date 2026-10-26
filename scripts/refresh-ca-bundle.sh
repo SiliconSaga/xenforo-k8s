@@ -184,8 +184,15 @@ expect_accept() {
     esac
 }
 
+# Both stores, not just the default one. ca-bundle-legacy-openssl.crt is a
+# trust store in its own right, and --check is the mode meant for a scheduled
+# probe — so checking only ca-bundle.crt here would let it report "clean" while
+# the legacy file still trusted a compromised chain. Same failure shape as the
+# capath trap below: a check that does not look at everything it claims to
+# clear is worse than no check, because it is believed.
 echo "--- before ---"
 check_bundle ca-bundle.crt "$XFH/ca-bundle.crt"
+check_bundle ca-bundle-legacy-openssl.crt "$XFH/ca-bundle-legacy-openssl.crt"
 
 if [[ "$CHECK_ONLY" -eq 1 ]]; then
     if [[ "$SAW_ACCEPT" -eq 1 ]]; then
