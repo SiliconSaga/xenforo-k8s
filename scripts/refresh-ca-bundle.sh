@@ -217,6 +217,11 @@ cleanup() {
     local rc=$?
     rm -rf "$WORK"
     in_pod rm -rf "$STAGE" || true
+    # Any .partial is a copy that did not finish, so it is never useful.
+    in_pod rm -f "$XFH/ca-bundle.crt$RB.partial" \
+                 "$XFH/ca-bundle-legacy-openssl.crt$RB.partial" \
+                 "$XFH/ca-bundle.crt.bak-$STAMP.partial" \
+                 "$XFH/ca-bundle-legacy-openssl.crt.bak-$STAMP.partial" || true
     if [[ "$rc" -eq 0 ]]; then
         if [[ "$BACKED_UP" -eq 1 ]]; then
             in_pod rm -f "$XFH/ca-bundle.crt$RB" "$XFH/ca-bundle-legacy-openssl.crt$RB" || true
@@ -269,16 +274,33 @@ echo "--- backing up current bundles ---"
 # other's: if the first cp succeeded and the second failed, a retry that keyed
 # off a single sentinel would skip both, leave the legacy bundle with no
 # archival copy, and then delete the rollback copies on success.
+# Both kinds of copy are written to a .partial name and renamed only once cp
+# has returned. cp -a can fail part-way — a full volume is the obvious way —
+# and a truncated file still satisfies `test -e`, so a same-day retry would
+# keep a broken archive and a successful run would then delete the per-run
+# rollback copies, leaving no intact pre-refresh copy at all. rename is atomic
+# on the same filesystem, so a name that exists is a copy that finished.
+#
+# An existing dated copy is also parsed before it is trusted, for the same
+# reason: its presence is not evidence that it is whole.
+backup_to() {
+    local src="$1" dest="$2"
+    in_pod cp -a "$src" "$dest.partial"
+    in_pod mv "$dest.partial" "$dest"
+}
+
 for f in ca-bundle.crt ca-bundle-legacy-openssl.crt; do
-    if in_pod test -e "$XFH/$f.bak-$STAMP" 2>/dev/null; then
-        echo "  $f.bak-$STAMP exists already — keeping it as the archival copy"
+    bak="$XFH/$f.bak-$STAMP"
+    if in_pod test -e "$bak" 2>/dev/null && in_pod grep -q 'BEGIN CERTIFICATE' "$bak" 2>/dev/null; then
+        echo "  $f.bak-$STAMP exists and parses — keeping it as the archival copy"
     else
-        in_pod cp -a "$XFH/$f" "$XFH/$f.bak-$STAMP"
+        backup_to "$XFH/$f" "$bak"
         echo "  archival copy written: $f.bak-$STAMP"
     fi
 done
-in_pod cp -a "$XFH/ca-bundle.crt" "$XFH/ca-bundle.crt$RB"
-in_pod cp -a "$XFH/ca-bundle-legacy-openssl.crt" "$XFH/ca-bundle-legacy-openssl.crt$RB"
+for f in ca-bundle.crt ca-bundle-legacy-openssl.crt; do
+    backup_to "$XFH/$f" "$XFH/$f$RB"
+done
 echo "  rollback copies written: *$RB"
 BACKED_UP=1
 
