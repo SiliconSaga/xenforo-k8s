@@ -73,10 +73,18 @@ done
 KUBECTL=${KUBECTL:-kubectl}
 XFH=/var/www/html/src/XF/Http
 STAMP="$(date -u +%Y%m%d)"
-STAGE="/tmp/ca-refresh-$STAMP"
+# Every scratch path this run owns is keyed to the PID, not the date. Two
+# operators refreshing the same pod on the same day otherwise share both the
+# staging directory and the .partial names — and cleanup rm -rf's the staging
+# directory, so one run would delete the other's candidate mid-validation.
+# Per-run paths beat a lock here: no stale-lock failure mode, and the only
+# genuinely shared writes left are the final renames, where both runs install
+# byte-identical content from the same upstream extract.
+RUN_ID="$$"
+STAGE="/tmp/ca-refresh-$STAMP.$RUN_ID"
 # Per-run suffix for this attempt's undo copies. Distinct from .bak-$STAMP on
 # purpose — see the backup step for why one archival copy and one fresh copy.
-RB=".rollback-$$"
+RB=".rollback-$RUN_ID"
 
 POD="$("$KUBECTL" -n "$NS" get pod -l "$SELECTOR" -o jsonpath='{.items[0].metadata.name}')"
 [[ -n "$POD" ]] || { echo "no pod matched -l $SELECTOR in namespace $NS" >&2; exit 1; }
@@ -218,10 +226,10 @@ cleanup() {
     rm -rf "$WORK"
     in_pod rm -rf "$STAGE" || true
     # Any .partial is a copy that did not finish, so it is never useful.
-    in_pod rm -f "$XFH/ca-bundle.crt$RB.partial" \
-                 "$XFH/ca-bundle-legacy-openssl.crt$RB.partial" \
-                 "$XFH/ca-bundle.crt.bak-$STAMP.partial" \
-                 "$XFH/ca-bundle-legacy-openssl.crt.bak-$STAMP.partial" || true
+    in_pod rm -f "$XFH/ca-bundle.crt$RB.partial-$RUN_ID" \
+                 "$XFH/ca-bundle-legacy-openssl.crt$RB.partial-$RUN_ID" \
+                 "$XFH/ca-bundle.crt.bak-$STAMP.partial-$RUN_ID" \
+                 "$XFH/ca-bundle-legacy-openssl.crt.bak-$STAMP.partial-$RUN_ID" || true
     if [[ "$rc" -eq 0 ]]; then
         if [[ "$BACKED_UP" -eq 1 ]]; then
             in_pod rm -f "$XFH/ca-bundle.crt$RB" "$XFH/ca-bundle-legacy-openssl.crt$RB" || true
@@ -285,8 +293,8 @@ echo "--- backing up current bundles ---"
 # reason: its presence is not evidence that it is whole.
 backup_to() {
     local src="$1" dest="$2"
-    in_pod cp -a "$src" "$dest.partial"
-    in_pod mv "$dest.partial" "$dest"
+    in_pod cp -a "$src" "$dest.partial-$RUN_ID"
+    in_pod mv "$dest.partial-$RUN_ID" "$dest"
 }
 
 for f in ca-bundle.crt ca-bundle-legacy-openssl.crt; do
