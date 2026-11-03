@@ -4,19 +4,47 @@ Two things upgrade independently, and keeping them separate is the point of the 
 
 ## Upgrading the runtime image
 
-Nothing to do — CI rebuilds `ghcr.io/siliconsaga/xenforo-k8s:latest` on every push to `image/`, and weekly for base-image security fixes. Roll it out with:
+CI rebuilds `ghcr.io/siliconsaga/xenforo-k8s` on every push to `image/`, and weekly for base-image security fixes. But `kustomize/base/kustomization.yaml` pins a **digest**, so a rebuild does not reach the cluster until someone bumps it. That is deliberate — see the comment there — and it means the image upgrade is a four-step job, not zero.
+
+1. **Find the new index digest.** Not a per-platform one: the index digest is what lets amd64 GKE nodes and arm64 k3d dev clusters resolve from the same pin.
+
+   ```bash
+   docker buildx imagetools inspect ghcr.io/siliconsaga/xenforo-k8s:latest
+   ```
+
+   The top-level `Digest:` is the one you want. This talks to the registry, not the local daemon, so it works even when Docker is unhealthy.
+
+2. **Verify it before pinning it.** A green CI log says the build succeeded, not that the result is what you think. Check the three things that have actually gone wrong here — PHP version, CA package version, and whether the trust store rejects a known-bad chain:
+
+   ```bash
+   docker run --rm --platform linux/amd64 ghcr.io/siliconsaga/xenforo-k8s:latest php -v
+   docker run --rm --platform linux/amd64 ghcr.io/siliconsaga/xenforo-k8s:latest apk list --installed ca-certificates
+   ```
+
+   With no working Docker, run the same checks as a throwaway pod on the digest — which also tests exactly what the cluster will pull:
+
+   ```bash
+   kubectl -n xenforo run xf-image-probe --restart=Never --image=ghcr.io/siliconsaga/xenforo-k8s@sha256:... \
+     --command -- sh -c 'php -v | head -n1; apk list --installed ca-certificates'
+   kubectl -n xenforo logs xf-image-probe
+   kubectl -n xenforo delete pod xf-image-probe
+   ```
+
+3. **Bump the digest** in `kustomize/base/kustomization.yaml` and commit it. The commit is the record of what the cluster runs — the thing `latest` could never give you.
+
+4. **Roll out.** The pod spec changed, so this is a real rollout with a real rollback:
+
+   ```bash
+   kubectl -n xenforo rollout restart deploy/xenforo
+   kubectl -n xenforo rollout status deploy/xenforo
+   ```
+
+   Roll back by reverting the commit, or `kubectl -n xenforo rollout undo deploy/xenforo` for an immediate fix.
+
+Afterwards, confirm the volume's CA bundle survived the pod swap — it lives on the PVC and should, but that is the assumption worth testing rather than asserting:
 
 ```bash
-kubectl -n xenforo rollout restart deploy/xenforo
-```
-
-For anything but a homelab, pin a digest in `kustomize/base/kustomization.yaml`'s `images:` block rather than tracking `latest`, so a rollout is a deliberate act with something to roll back to:
-
-```yaml
-images:
-  - name: ghcr.io/siliconsaga/xenforo-k8s
-    newName: ghcr.io/siliconsaga/xenforo-k8s
-    digest: sha256:...
+scripts/refresh-ca-bundle.sh --check
 ```
 
 ## Upgrading XenForo itself
