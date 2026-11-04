@@ -157,17 +157,18 @@ XenForo upgrades are file-replacement plus a schema migration, and both happen a
    The volume is the other half, and the `.sql.gz` does **not** contain it: `internal_data/` holds the attachments. Velero snapshots it:
 
    ```bash
-   velero backup create xenforo-pre-<version> --include-namespaces xenforo --snapshot-volumes
+   velero backup create xenforo-pre-<version> --include-namespaces xenforo \
+     --snapshot-volumes --wait
    ```
 
-   Check the snapshot *count*, not just the phase — a backup that captured metadata and no volumes also reports `Completed`:
+   **`--wait` is not cosmetic.** `backup create` returns as soon as the object is accepted, so the status read below would otherwise race the controller: an `InProgress` backup reports empty snapshot counts, and empty is easy to misread as "no volumes were captured" — or, worse, to skim as a pair of zeroes that look like a clean answer. Wait for a terminal phase, then read:
 
    ```bash
    kubectl -n velero get backups.velero.io xenforo-pre-<version> \
-     -o custom-columns='PHASE:.status.phase,TRIED:.status.volumeSnapshotsAttempted,DONE:.status.volumeSnapshotsCompleted'
+     -o custom-columns='PHASE:.status.phase,TRIED:.status.volumeSnapshotsAttempted,DONE:.status.volumeSnapshotsCompleted,ERR:.status.errors'
    ```
 
-   For the 2.3.13 upgrade that read `Completed / 2 / 2` — both `xenforo-data` and `xenforo-backups`, zero errors.
+   Then check the snapshot *count*, not just the phase — a backup that captured metadata and no volumes also reports `Completed`. Two assertions, both required: `PHASE` is exactly `Completed` (**not** `PartiallyFailed`, which is a terminal phase that also carries real data and is easy to accept by reflex), and `DONE` equals `TRIED` and is non-zero. For the 2.3.13 upgrade that read `Completed / 2 / 2 / <none>` — both `xenforo-data` and `xenforo-backups`.
 
 2. **Rehearse in the Docker flavor, against the real data.** This is the main reason flavor 1 exists, and it costs a few minutes if you skip what the migration cannot touch.
 
@@ -191,21 +192,30 @@ XenForo upgrades are file-replacement plus a schema migration, and both happen a
    ```bash
    gunzip -k xenforo-<stamp>.sql.gz
    tail -5 xenforo-<stamp>.sql          # `-- Dump completed` must be present
-   docker compose up -d db
-   docker cp xenforo-<stamp>.sql docker-db-1:/tmp/dump.sql
-   docker exec -e MYSQL_PWD="$XF_DB_PASSWORD" docker-db-1 \
+   docker compose -f docker/compose.yaml up -d db
+   docker compose -f docker/compose.yaml cp xenforo-<stamp>.sql db:/tmp/dump.sql
+   docker compose -f docker/compose.yaml exec -e MYSQL_PWD="$XF_DB_PASSWORD" db \
      mysql -u xenforo xenforo -e "source /tmp/dump.sql"
    ```
+
+   Address the stack by **compose file and service name**, never by container name. `docker-db-1` is a *generated* name: it is the project name plus the service plus an index, and the project name defaults to the containing directory — so it is `docker-db-1` only while you happen to be standing in `docker/`. Run the same `docker cp` from the component root, or under a `-p` flag, or alongside a second copy of the stack, and it addresses nothing or the wrong thing. `-f docker/compose.yaml` also lets every command in this runbook be pasted from one directory.
 
    **Rehearse on the pinned image, not a local build.** `docker compose build` takes ~25 minutes; tagging the digest the cluster actually runs takes seconds and is strictly better fidelity:
 
    ```bash
    docker pull ghcr.io/siliconsaga/xenforo-k8s@<digest-from-kustomization>
    docker tag  ghcr.io/siliconsaga/xenforo-k8s@<digest-from-kustomization> xenforo-k8s:local
-   docker compose up -d --no-build xenforo caddy
+   docker compose -f docker/compose.yaml up -d --no-build xenforo caddy
    ```
 
-   Unpack the release's `upload/` over `docker/xf/`, run `php cmd.php xf:upgrade --no-interaction --skip-statistics`, and confirm the forum renders on `http://localhost:8080/` before going near the cluster.
+   Then unpack the release's `upload/` over `docker/xf/` and run the migration **inside that container**, which is the whole point of pinning it:
+
+   ```bash
+   docker compose -f docker/compose.yaml exec -w /var/www/html xenforo \
+     php cmd.php xf:upgrade --no-interaction --skip-statistics
+   ```
+
+   A bare `php cmd.php` on the host runs whatever PHP the workstation has — a different version, without the image's extensions, and on macOS usually none at all. The rehearsal is only worth something if it runs on the same PHP the cluster will. Confirm the forum renders on `http://localhost:8080/` before going near the cluster.
 
    **Compare raw row counts, not the forum's own figures.** `xf_user`, `xf_post`, `xf_thread`, `xf_attachment` and `xf_template` must be identical across the migration. The rendered stat block is filtered and will not show you a loss — it reported 2,965 "Members" against 29,026 rows in `xf_user`, because the difference is unconfirmed and rejected registrations.
 
@@ -223,16 +233,26 @@ XenForo upgrades are file-replacement plus a schema migration, and both happen a
 
    XenForo release archives are meant to be unpacked over an existing install. Do not delete the tree first — `internal_data/` and `data/` hold your attachments, and `src/config.php` is not in the archive, so an overlay leaves it alone. Confirm that last point rather than trust it; without `config.php` the forum cannot reach its database at all.
 
-   ⚠ **Fix ownership afterwards — the tarball does not save you from this, it only moves it.** `kubectl cp` lands files as your *local* uid/gid, and `tar` run as root faithfully restores whatever uid/gid the archive recorded, so a tarball built on a workstation extracts as that workstation's user. After the 2.3.13 extract the tree read `502 wheel` with the setgid bit and group-write gone (`drwxr-xr-x` where it had been `drwxrwsr-x`). The forum still *served*, because `other` keeps read — which is exactly why this is easy to miss. The convention is `root:www-data`, `2775` on directories and `664` on files, so that the ACP can write as `www-data`:
+   ⚠ **Fix ownership afterwards — the tarball does not save you from this, it only moves it.** `kubectl cp` lands files as your *local* uid/gid, and `tar` run as root faithfully restores whatever uid/gid the archive recorded, so a tarball built on a workstation extracts as that workstation's user. After the 2.3.13 extract the tree read `502 wheel` with the setgid bit and group-write gone (`drwxr-xr-x` where it had been `drwxrwsr-x`). The forum still *served*, because `other` keeps read — which is exactly why this is easy to miss.
+
+   **XenForo needs exactly three paths writable: `internal_data/`, `data/`, and `src/addons/`** (the last only to install add-ons through the ACP). Everything else is application code, and php-fpm runs as `www-data` — so group-write on the code means the process serving the forum can rewrite the code serving the forum. Restore the two sets separately, code first so the writable paths win where they nest under `src/`:
 
    ```bash
+   # Application code: owned by root, readable by php-fpm, NOT writable by it.
    kubectl -n xenforo exec "$POD" -c php-fpm -- chown -R root:www-data <extracted paths>
-   kubectl -n xenforo exec "$POD" -c php-fpm -- find <extracted dirs> -type d -exec chmod 2775 {} +
-   kubectl -n xenforo exec "$POD" -c php-fpm -- find <extracted dirs> -type f -exec chmod 664 {} +
-   kubectl -n xenforo exec "$POD" -c php-fpm -- chmod 644 /var/www/html/src/config.php
+   kubectl -n xenforo exec "$POD" -c php-fpm -- find <extracted paths> -type d -exec chmod 755 {} +
+   kubectl -n xenforo exec "$POD" -c php-fpm -- find <extracted paths> -type f -exec chmod 644 {} +
+
+   # The three XenForo writes to. setgid so new files inherit the group.
+   kubectl -n xenforo exec "$POD" -c php-fpm -- \
+     chown -R www-data:www-data /var/www/html/internal_data /var/www/html/data /var/www/html/src/addons
+   kubectl -n xenforo exec "$POD" -c php-fpm -- \
+     find /var/www/html/internal_data /var/www/html/data /var/www/html/src/addons -type d -exec chmod 2775 {} +
    ```
 
-   Leave `internal_data/` and `data/` out of the chown — they are `www-data:www-data` by design. And put `config.php` back to `644` explicitly: it holds the database password, so it should not pick up group-write from a blanket `find` over `src/`.
+   `config.php` needs no special case under this scheme — `644` falls out of the code rule, and it holds the database password, so that is where you want it. Under the older blanket `664` it had to be clawed back by hand, which is a good sign the blanket was wrong.
+
+   ⚠ **This is stricter than what the live tree inherited.** As of 2026-11-04 the deployed forum carries `drwxrwsr-x root:www-data` on code — group-writable — because that is how the original install was seeded and the 2.3.13 upgrade faithfully restored it. The three writable paths were already correct and `www-data`-owned, so tightening the rest is a contained change rather than a redesign; it is listed here because the runbook should stop propagating the looser form, and applying it to the running forum is a deliberate step to take on its own, with a Velero snapshot in hand, not folded into an upgrade.
 
    `COPYFILE_DISABLE=1` is a macOS detail: without it `tar` embeds AppleDouble xattrs and busybox in the pod prints one `Ignoring unknown extended header keyword` line per file, burying any real error in thousands of lines of noise.
 

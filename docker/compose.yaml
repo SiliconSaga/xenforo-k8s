@@ -37,8 +37,22 @@ services:
 
   caddy:
     image: caddy:2.11-alpine
+    # Long form, because `restart: true` is the half that matters. Sharing a
+    # network namespace (below) means restarting `xenforo` tears down the very
+    # namespace this container lives in, and caddy stays attached to the dead
+    # one while the published port moves to the new one. Measured: `docker
+    # restart docker-xenforo-1` leaves caddy reporting `Up 17 seconds` and the
+    # port answering curl 52, empty reply — not a 502, because nothing is
+    # listening in the namespace the port now belongs to. Compose only
+    # propagates the restart if asked, and `docker compose restart xenforo`
+    # with this block restarts both and comes back 200.
+    #
+    # `service_started`, not `service_healthy`: php-fpm declares no healthcheck,
+    # and waiting on one that does not exist hangs. Needs Compose v2.17+.
     depends_on:
-      - xenforo
+      xenforo:
+        condition: service_started
+        restart: true
     # ⚠ Load-bearing, and the reason this file cannot just list a `ports:` of
     # its own. The shared Caddyfile says `php_fastcgi 127.0.0.1:9000` because in
     # the Kubernetes flavors caddy is a SIDECAR in the xenforo pod, sharing one
