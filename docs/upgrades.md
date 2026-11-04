@@ -144,7 +144,9 @@ XenForo upgrades are file-replacement plus a schema migration, and both happen a
 
 1. **Back up first, and verify both halves.** A half-migrated forum needs the database *and* the volume to roll back.
 
-   A nightly `xenforo-db-backup` CronJob already exists with 14-day retention, so take a fresh run of it rather than hand-rolling a dump. It carries the `--set-gtid-purged=OFF` and `--no-tablespaces` flags a vended DataService tenant needs, and it verifies its own output — `gzip -t` plus mysqldump's `-- Dump completed` footer — before publishing the file under its real name:
+   **Which half applies depends on the overlay, and the two are opposites.** `components/backup` is composed only by `kustomize/overlays/gitops`, so the CronJob below exists there and *only* there; `components/db-throwaway` and its local `xenforo-db` Deployment belong only to `plain`. Check with `kubectl -n xenforo get cronjob` before picking.
+
+   On the **gitops** overlay a nightly `xenforo-db-backup` CronJob already exists with 14-day retention, so take a fresh run of it rather than hand-rolling a dump. It carries the `--set-gtid-purged=OFF` and `--no-tablespaces` flags a vended DataService tenant needs, and it verifies its own output — `gzip -t` plus mysqldump's `-- Dump completed` footer — before publishing the file under its real name:
 
    ```bash
    kubectl -n xenforo create job xenforo-db-pre-<version> --from=cronjob/xenforo-db-backup
@@ -152,7 +154,9 @@ XenForo upgrades are file-replacement plus a schema migration, and both happen a
    kubectl -n xenforo logs job/xenforo-db-pre-<version>
    ```
 
-   ⚠ **Do not reach for `kubectl exec deploy/xenforo-db -- mysqldump`.** That is the *plain* flavor, and this document said so for longer than it should have. On the **gitops** overlay there is no `xenforo-db` Deployment at all — the database is mimir's shared MySQL, reached through the `xenforo-db-dataservice` Secret — so the command fails with `deployments.apps "xenforo-db" not found`, which reads like "backups are impossible here" rather than "wrong flavor".
+   ⚠ **On gitops, do not reach for `kubectl exec deploy/xenforo-db -- mysqldump`** — this document said to for longer than it should have. There is no `xenforo-db` Deployment on that overlay at all; the database is mimir's shared MySQL, reached through the `xenforo-db-dataservice` Secret, so the command fails with `deployments.apps "xenforo-db" not found`, which reads like "backups are impossible here" rather than "wrong flavor".
+
+   ⚠ **And on `plain`, the CronJob above is the one that does not exist** — `create job --from=cronjob/xenforo-db-backup` fails `not found` there. That flavor has a local `xenforo-db`, so the `exec … mysqldump` form is the right one, piped through `gzip -c` and checked the same two ways the CronJob checks itself (`gzip -t`, then the `-- Dump completed` footer) before you trust it. **Each overlay's correct procedure is the other's error**, which is exactly how a single unqualified instruction ends up wrong for half its readers.
 
    The volume is the other half, and the `.sql.gz` does **not** contain it: `internal_data/` holds the attachments. Velero snapshots it:
 
@@ -243,9 +247,16 @@ XenForo upgrades are file-replacement plus a schema migration, and both happen a
 
    ```bash
    # Application code: owned by root, readable by php-fpm, NOT writable by it.
-   kubectl -n xenforo exec "$POD" -c php-fpm -- chown -R root:www-data <extracted paths>
-   kubectl -n xenforo exec "$POD" -c php-fpm -- find <extracted paths> -type d -exec chmod 755 {} +
-   kubectl -n xenforo exec "$POD" -c php-fpm -- find <extracted paths> -type f -exec chmod 644 {} +
+   # The archive's own top level IS the list of what was just extracted, so
+   # derive it rather than maintaining a copy that can drift.
+   kubectl -n xenforo exec "$POD" -c php-fpm -- sh -c '
+     set -eu
+     cd /var/www/html
+     CODE=$(tar -tzf /tmp/xf-new.tgz | sed -n "s|^\./\([^/][^/]*\)/\{0,1\}$|\1|p")
+     chown -R root:www-data $CODE
+     find $CODE -type d -exec chmod 755 {} +
+     find $CODE -type f -exec chmod 644 {} +
+   '
 
    # The three XenForo writes to. setgid so new files inherit the group.
    kubectl -n xenforo exec "$POD" -c php-fpm -- \
@@ -253,6 +264,10 @@ XenForo upgrades are file-replacement plus a schema migration, and both happen a
    kubectl -n xenforo exec "$POD" -c php-fpm -- \
      find /var/www/html/internal_data /var/www/html/data /var/www/html/src/addons -type d -exec chmod 2775 {} +
    ```
+
+   For 2.3.13 that derives 20 entries — `admin.php`, `cmd.php`, `connected_account.php`, `css.php`, `embed.php`, `htaccess.txt`, `index.php`, `install`, `job.php`, `js`, `library`, `oembed.php`, `payment_callback.php`, `proxy.php`, `service_worker.js`, `sitemap.php`, `src`, `styles`, `unfurl.php`, `webmanifest.php`.
+
+   **Scope it to the release, not to the volume.** `chown -R root:www-data /var/www/html` is the tempting shortcut and it is wrong twice over: it walks the 855MB of `internal_data` for no reason, and it strips the setgid bit and resets file modes across every attachment before the three-path repair below puts *directories* back — file modes it never restores. Deriving the list from the tarball touches exactly what was written and nothing else, and it keeps working when a future XenForo adds a top-level directory that a hand-maintained list would silently miss.
 
    `config.php` needs no special case under this scheme — `644` falls out of the code rule, and it holds the database password, so that is where you want it. Under the older blanket `664` it had to be clawed back by hand, which is a good sign the blanket was wrong.
 
