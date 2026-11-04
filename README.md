@@ -100,6 +100,17 @@ Two interchangeable components, and the pod spec is identical either way — onl
 
 Pin a digest for anything you care about; see [`docs/upgrades.md`](docs/upgrades.md).
 
+## Checks
+
+Two, both of which run with no cluster and no credentials:
+
+```bash
+tests/render-all.sh       # every kustomize overlay still builds  (ws test xenforo-k8s)
+tests/lint-runbooks.sh    # every shell block in every tracked *.md still parses
+```
+
+The second one exists because the docs here are runbooks: their blocks get pasted into a terminal mid-upgrade, and `bash -n` catches what reading does not — an angle-bracket placeholder (`<digest>` is redirection, not a blank to fill), or an apostrophe inside `sh -c '…'` that closes the quoted body early and runs the rest on your own machine. It is wired into [`.github/workflows/docs.yml`](.github/workflows/docs.yml); `ws test` currently runs only the renderer.
+
 ## Adding Access
 
 To give another maintainer the minimally required access to Kubernetes to work with this setup:
