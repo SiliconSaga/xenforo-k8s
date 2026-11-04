@@ -144,35 +144,91 @@ XenForo upgrades are file-replacement plus a schema migration, and both happen a
 
 1. **Back up first, and verify both halves.** A half-migrated forum needs the database *and* the volume to roll back.
 
+   Step 1 names the release several times, so set it once. Drop the dots: these become Kubernetes and Velero object names.
+
+   ```bash
+   VER=2313     # 2.3.13, the version you are upgrading TO
+   ```
+
    **Which half applies depends on the overlay, and the two are opposites.** `components/backup` is composed only by `kustomize/overlays/gitops`, so the CronJob below exists there and *only* there; `components/db-throwaway` and its local `xenforo-db` Deployment belong only to `plain`. Check with `kubectl -n xenforo get cronjob` before picking.
 
    On the **gitops** overlay a nightly `xenforo-db-backup` CronJob already exists with 14-day retention, so take a fresh run of it rather than hand-rolling a dump. It carries the `--set-gtid-purged=OFF` and `--no-tablespaces` flags a vended DataService tenant needs, and it verifies its own output — `gzip -t` plus mysqldump's `-- Dump completed` footer — before publishing the file under its real name:
 
    ```bash
-   kubectl -n xenforo create job xenforo-db-pre-<version> --from=cronjob/xenforo-db-backup
-   kubectl -n xenforo wait --for=condition=Complete job/xenforo-db-pre-<version> --timeout=300s
-   kubectl -n xenforo logs job/xenforo-db-pre-<version>
+   kubectl -n xenforo create job "xenforo-db-pre-$VER" --from=cronjob/xenforo-db-backup
+   kubectl -n xenforo wait --for=condition=Complete "job/xenforo-db-pre-$VER" --timeout=300s
+   kubectl -n xenforo logs "job/xenforo-db-pre-$VER"
    ```
 
    ⚠ **On gitops, do not reach for `kubectl exec deploy/xenforo-db -- mysqldump`** — this document said to for longer than it should have. There is no `xenforo-db` Deployment on that overlay at all; the database is mimir's shared MySQL, reached through the `xenforo-db-dataservice` Secret, so the command fails with `deployments.apps "xenforo-db" not found`, which reads like "backups are impossible here" rather than "wrong flavor".
 
-   ⚠ **And on `plain`, the CronJob above is the one that does not exist** — `create job --from=cronjob/xenforo-db-backup` fails `not found` there. That flavor has a local `xenforo-db`, so the `exec … mysqldump` form is the right one, piped through `gzip -c` and checked the same two ways the CronJob checks itself (`gzip -t`, then the `-- Dump completed` footer) before you trust it. **Each overlay's correct procedure is the other's error**, which is exactly how a single unqualified instruction ends up wrong for half its readers.
+   ⚠ **And on `plain`, the CronJob above is the one that does not exist** — `create job --from=cronjob/xenforo-db-backup` fails `not found` there. **Each overlay's correct procedure is the other's error**, which is how a single unqualified instruction ends up wrong for half its readers. That flavor has a local `xenforo-db`, so dump it in place, with the same flags and the same two self-checks the CronJob applies to itself:
+
+   ```bash
+   kubectl -n xenforo rollout status deploy/xenforo-db --timeout=120s
+   kubectl -n xenforo exec deploy/xenforo-db -- sh -c '
+     set -euo pipefail
+
+     # A defaults file, not --password=: anything in argv is readable from
+     # `ps` by every process in the container. The Deployment mounts the
+     # password from the `xenforo-secrets` Secret, so read it from there —
+     # this container has no MYSQL_PASSWORD env var to borrow, only
+     # MYSQL_PASSWORD_FILE.
+     umask 077
+     cat > /tmp/my.cnf <<EOF
+   [client]
+   password=$(cat /run/secrets/xenforo/db-password)
+   EOF
+
+     mysqldump \
+       --defaults-extra-file=/tmp/my.cnf \
+       --user="$MYSQL_USER" \
+       --single-transaction \
+       --set-gtid-purged=OFF \
+       --no-tablespaces \
+       --quick \
+       --default-character-set=utf8mb4 \
+       "$MYSQL_DATABASE" | gzip -c > /tmp/xenforo-pre.sql.gz
+
+     gzip -t /tmp/xenforo-pre.sql.gz
+     gzip -cd /tmp/xenforo-pre.sql.gz | tail -5 | grep -q "^-- Dump completed"
+     rm -f /tmp/my.cnf
+     stat -c %s /tmp/xenforo-pre.sql.gz
+   '
+   ```
+
+   The heredoc body sits at column 0 on purpose: `<<EOF` takes its terminator there, and the single-quoted `sh -c` body is what defers `$(cat …)`, `$MYSQL_USER` and `$MYSQL_DATABASE` to the container instead of expanding them in your shell.
+
+   Then get the file off the pod, because `/tmp` dies with the container — and this Deployment is `Recreate`, so the next `kubectl apply` kills it:
+
+   ```bash
+   DB=$(kubectl -n xenforo get pod -l app=xenforo-db -o name)
+   DB=${DB#pod/}
+   kubectl -n xenforo cp "$DB:/tmp/xenforo-pre.sql.gz" "./xenforo-pre-$VER.sql.gz" --retries=5
+   gzip -t "./xenforo-pre-$VER.sql.gz"
+   ```
+
+   Compare the local byte count against the `stat` the dump printed — the truncation `--retries` exists for is described under step 2.
+
+   **`set -o pipefail` is the line that makes this a backup rather than a file.** `mysqldump` pipes into `gzip`, and a shell reports only the last command's status, so a dump that dies on connect still leaves `gzip` exiting 0. Measured in a throwaway `mysql:8.4`: without `pipefail` that sequence exits **0**, writes a **20-byte** `.sql.gz`, and **`gzip -t` passes on it** — a perfectly valid archive of nothing. Only the `-- Dump completed` footer rejects it, which is why both checks are here and neither is redundant. (`pipefail` is safe to rely on in this container: `/bin/sh` in `mysql:8.4` is bash.)
+
+   ⚠ **The two dumps are not interchangeable as *rollback* artifacts**, though the commands produce the same shape of file. `plain` dumps the throwaway database that overlay owns; gitops dumps mimir's shared MySQL through the vended tenant. Restoring one into the other populates the wrong database — the same hazard step 4's overlay warning describes from the other end.
 
    The volume is the other half, and the `.sql.gz` does **not** contain it: `internal_data/` holds the attachments. Velero snapshots it:
 
    ```bash
-   velero backup create xenforo-pre-<version> --include-namespaces xenforo \
+   velero backup create "xenforo-pre-$VER" --include-namespaces xenforo \
      --snapshot-volumes --wait
    ```
 
    **`--wait` is not cosmetic.** `backup create` returns as soon as the object is accepted, so the status read below would otherwise race the controller: an `InProgress` backup reports empty snapshot counts, and empty is easy to misread as "no volumes were captured" — or, worse, to skim as a pair of zeroes that look like a clean answer. Wait for a terminal phase, then read:
 
    ```bash
-   kubectl -n velero get backups.velero.io xenforo-pre-<version> \
+   kubectl -n velero get backups.velero.io "xenforo-pre-$VER" \
      -o custom-columns='PHASE:.status.phase,TRIED:.status.volumeSnapshotsAttempted,DONE:.status.volumeSnapshotsCompleted,ERR:.status.errors'
    ```
 
-   Then check the snapshot *count*, not just the phase — a backup that captured metadata and no volumes also reports `Completed`. Two assertions, both required: `PHASE` is exactly `Completed` (**not** `PartiallyFailed`, which is a terminal phase that also carries real data and is easy to accept by reflex), and `DONE` equals `TRIED` and is non-zero. For the 2.3.13 upgrade that read `Completed / 2 / 2 / <none>` — both `xenforo-data` and `xenforo-backups`.
+   Then check the snapshot *count*, not just the phase — a backup that captured metadata and no volumes also reports `Completed`. Two assertions, both required: `PHASE` is exactly `Completed` (**not** `PartiallyFailed`, which is a terminal phase that also carries real data and is easy to accept by reflex), and `DONE` equals `TRIED` and is non-zero. For the 2.3.13 upgrade that read `Completed / 2 / 2 / <none>` (as `xenforo-pre-2313`) — both `xenforo-data` and `xenforo-backups`.
 
 2. **Rehearse in the Docker flavor, against the real data.** This is the main reason flavor 1 exists, and it costs a few minutes if you skip what the migration cannot touch.
 
