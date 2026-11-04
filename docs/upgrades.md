@@ -14,32 +14,60 @@ CI rebuilds `ghcr.io/siliconsaga/xenforo-k8s` on every push to `image/`, and wee
 
    The top-level `Digest:` is the one you want. This talks to the registry, not the local daemon, so it works even when Docker is unhealthy.
 
-2. **Verify it before pinning it.** A green CI log says the build succeeded, not that the result is what you think. Check the three things that have actually gone wrong here — PHP version, CA package version, and whether the trust store rejects a known-bad chain:
+2. **Verify it before pinning it.** A green CI log says the build succeeded, not that the result is what you think. Check the three things that have actually gone wrong here — PHP version, CA package version, and whether the trust store rejects a known-bad chain.
+
+   Set the digest once and check **that**, never `:latest`. The tag can move between step 1 and step 2, and a stale local tag can answer for a different image entirely — verifying `:latest` and then committing a digest checks something you are not shipping:
 
    ```bash
-   docker run --rm --platform linux/amd64 ghcr.io/siliconsaga/xenforo-k8s:latest php -v
-   docker run --rm --platform linux/amd64 ghcr.io/siliconsaga/xenforo-k8s:latest apk list --installed ca-certificates
+   D=ghcr.io/siliconsaga/xenforo-k8s@sha256:<digest-from-step-1>
+
+   docker run --rm --platform linux/amd64 "$D" php -v
+   docker run --rm --platform linux/amd64 "$D" apk list --installed ca-certificates
+   docker run --rm --platform linux/amd64 "$D" \
+     curl -sS --max-time 20 -o /dev/null https://dv-g3b-emudhra.we-have-a-problem.com/
    ```
 
-   With no working Docker, run the same checks as a throwaway pod on the digest — which also tests exactly what the cluster will pull:
+   **The third command must FAIL, with exit 60.** It is a negative control: that host serves a chain built on one of the recoverable eMudhra keys, so a zero exit means the image's trust store still accepts it and the digest must not be pinned. Exit 60 is `CURLE_PEER_FAILED_VERIFICATION`; any other non-zero exit means the probe never reached a TLS verdict (DNS, egress, timeout) and has told you nothing — see the three-way logic in `scripts/refresh-ca-bundle.sh`.
+
+   With no working Docker, run the same checks as a throwaway pod on the digest — which also tests exactly what the cluster will pull. The script asserts rather than prints, so the pod's phase *is* the result:
 
    ```bash
-   kubectl -n xenforo run xf-image-probe --restart=Never --image=ghcr.io/siliconsaga/xenforo-k8s@sha256:... \
-     --command -- sh -c 'php -v | head -n1; apk list --installed ca-certificates'
+   kubectl -n xenforo run xf-image-probe --restart=Never \
+     --image=ghcr.io/siliconsaga/xenforo-k8s@sha256:<digest-from-step-1> \
+     --command -- sh -c '
+       set -eu
+       php -v
+       apk list --installed ca-certificates
+       if curl -sS --max-time 20 -o /dev/null https://dv-g3b-emudhra.we-have-a-problem.com/; then
+         echo "FATAL: trust store ACCEPTS the compromised chain" >&2
+         exit 1
+       fi
+       echo "OK: compromised chain rejected"
+     '
+
+   kubectl -n xenforo wait --for=jsonpath='{.status.phase}'=Succeeded pod/xf-image-probe --timeout=180s
    kubectl -n xenforo logs xf-image-probe
    kubectl -n xenforo delete pod xf-image-probe
    ```
 
+   Two details that are easy to get wrong and both were, here. **Wait for the pod**: `kubectl run --restart=Never` returns while the pod is still `Pending`, so reading logs immediately can fail before the container has started — and a failed `logs` call looks like a broken probe rather than a race. **Do not pipe `php -v`**: `php -v | head -n1` discards PHP's exit status, and chaining with `;` reports only the last command's, so the probe can pass with no working PHP at all. `set -eu` plus unpiped commands is what makes a failure a failure.
+
 3. **Bump the digest** in `kustomize/base/kustomization.yaml` and commit it. The commit is the record of what the cluster runs — the thing `latest` could never give you.
 
-4. **Roll out.** The pod spec changed, so this is a real rollout with a real rollback:
+4. **Apply, then roll out.** `rollout restart` alone is *not enough*: it recreates the pod from the Deployment the cluster already has, so with `:latest` it pulled whatever was newest, and with a digest it would faithfully redeploy the **old** digest. The changed manifest has to reach the cluster first.
+
+   This deployment runs the **gitops** overlay applied directly with `kubectl` — there is no ArgoCD Application for xenforo yet (that is still an open item), so the apply is manual:
 
    ```bash
-   kubectl -n xenforo rollout restart deploy/xenforo
+   kubectl apply -k kustomize/overlays/gitops
    kubectl -n xenforo rollout status deploy/xenforo
    ```
 
-   Roll back by reverting the commit, or `kubectl -n xenforo rollout undo deploy/xenforo` for an immediate fix.
+   `apply` changes the pod spec, which triggers the rollout on its own — no `rollout restart` needed. Under ArgoCD, the commit from step 3 replaces the apply, and for the plain flavor it is `kubectl apply -k kustomize/overlays/plain`.
+
+   ⚠ **Check which overlay the cluster is actually running before applying one.** They are not interchangeable: `plain` carries `db-throwaway` and a literal Secret, `gitops` carries `db-dataservice` and an HTTPRoute. Applying `plain` over this deployment would point the forum at a different, empty database. `kubectl -n xenforo get httproute,externalsecret` tells them apart — an HTTPRoute and no ExternalSecret is the gitops flavor.
+
+   Roll back by reverting the commit and applying again, or `kubectl -n xenforo rollout undo deploy/xenforo` for an immediate fix.
 
 Afterwards, confirm the volume's CA bundle survived the pod swap — it lives on the PVC and should, but that is the assumption worth testing rather than asserting:
 
