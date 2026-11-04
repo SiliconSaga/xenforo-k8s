@@ -63,13 +63,17 @@ CI rebuilds `ghcr.io/siliconsaga/xenforo-k8s` on every push to `image/`, and wee
 
    ```bash
    D=ghcr.io/siliconsaga/xenforo-k8s@sha256:<digest-from-step-1>
+   rc=0
    for p in linux/amd64 linux/arm64; do
      echo "== $p =="
-     docker run --rm --platform "$p" "$D" sh -c "$(cat verify-image.sh)"
+     docker run --rm --platform "$p" "$D" sh -c "$(cat verify-image.sh)" || rc=1
    done
+   [ "$rc" = 0 ] || { echo "FATAL: an architecture failed verification" >&2; exit 1; }
    ```
 
-   The non-native one runs under QEMU and is slower, but it is the same assertion. `set -e` in your shell, or checking the loop's exit, keeps a failure from scrolling past.
+   The non-native one runs under QEMU and is slower, but it is the same assertion.
+
+   **`rc` is load-bearing, because a `for` loop exits with the status of its *last* iteration.** Without it an amd64 variant that fails every floor still leaves the block at exit 0, so long as arm64 passes — the same "the command failed but the block succeeded" shape as the `curl -f` trap above, and which arch it hides depends only on listing order. Collecting into `rc` rather than relying on `set -e` is deliberate: `set -e` aborts on the first bad arch, and whether *both* variants are broken or only one is the difference between a bad build and a bad publish.
 
    With no working Docker, run it as a throwaway pod on the digest — which also tests exactly what the cluster will pull. Note this covers only the **node's** architecture, so it verifies that cluster's variant rather than both:
 
@@ -78,12 +82,16 @@ CI rebuilds `ghcr.io/siliconsaga/xenforo-k8s` on every push to `image/`, and wee
      --image=ghcr.io/siliconsaga/xenforo-k8s@sha256:<digest-from-step-1> \
      --command -- sh -c "$(cat verify-image.sh)"
 
-   kubectl -n xenforo wait --for=jsonpath='{.status.phase}'=Succeeded pod/xf-image-probe --timeout=180s
+   rc=0
+   kubectl -n xenforo wait --for=jsonpath='{.status.phase}'=Succeeded pod/xf-image-probe --timeout=180s || rc=$?
    kubectl -n xenforo logs xf-image-probe
    kubectl -n xenforo delete pod xf-image-probe
+   [ "$rc" = 0 ] || { echo "FATAL: probe never reached Succeeded (wait exit $rc)" >&2; exit 1; }
    ```
 
    The `wait` is load-bearing: `kubectl run --restart=Never` returns while the pod is still `Pending`, so reading logs immediately can fail before the container has started — and a failed `logs` call reads as a broken probe rather than a race. A non-`Succeeded` phase *is* the failure signal; the logs only tell you which branch tripped.
+
+   **Save that status before reading the logs, and re-assert it afterwards.** The `logs` and `delete` that follow both succeed against a *failed* pod, so the block without `rc` ends on `delete`'s exit 0 and reports a vulnerable image as verified. Print the logs and clean up either way — you want the diagnosis, and you do not want a leftover pod — but let the saved status have the last word.
 
    One more trap in the script above: `php -v | head -n1` would discard PHP's exit status, and chaining with `;` reports only the last command's. `set -eu` with unpiped commands is what makes a failure fail.
 
@@ -91,14 +99,16 @@ CI rebuilds `ghcr.io/siliconsaga/xenforo-k8s` on every push to `image/`, and wee
 
 4. **Apply, then roll out.** `rollout restart` alone is *not enough*: it recreates the pod from the Deployment the cluster already has, so with `:latest` it pulled whatever was newest, and with a digest it would faithfully redeploy the **old** digest. The changed manifest has to reach the cluster first.
 
-   This deployment runs the **gitops** overlay applied directly with `kubectl` — there is no ArgoCD Application for xenforo yet (that is still an open item), so the apply is manual:
+   **Which path delivers the digest depends on whether an ArgoCD Application owns xenforo — and today none does.** Checked on GKE 2026-11-03: `kubectl -n argo get applications` lists mimir, nordri, keycloak, velero and the rest, with no `xenforo` among them. So this deployment runs the **gitops** overlay applied directly with `kubectl`, and the manual apply below is the real path rather than a shortcut. Adopting xenforo into ArgoCD is still an open item.
 
    ```bash
    kubectl apply -k kustomize/overlays/gitops
    kubectl -n xenforo rollout status deploy/xenforo
    ```
 
-   `apply` changes the pod spec, which triggers the rollout on its own — no `rollout restart` needed. Under ArgoCD, the commit from step 3 replaces the apply, and for the plain flavor it is `kubectl apply -k kustomize/overlays/plain`.
+   `apply` changes the pod spec, which triggers the rollout on its own — no `rollout restart` needed. For the plain flavor it is `kubectl apply -k kustomize/overlays/plain`.
+
+   ⚠ **Re-check the Application list before each upgrade, because this step becomes actively misleading the moment xenforo is adopted.** [`install.md`](install.md) describes the ArgoCD path for Flavor 3, and there a direct apply is not merely redundant — it is silently undone. ArgoCD syncs from the in-cluster seed-Gitea, not from GitHub, and against a `selfHeal: true` Application a `kubectl apply` is reverted within ~3 minutes. `rollout status` would report the new digest live and the Deployment would quietly return to the old one: a green check and no change, which is worse than an honest failure. Once an `xenforo` Application exists, step 3's commit replaces step 4 entirely — re-hydrate with nordri's `update-embedded-git.sh <homelab|gke>`, hard-refresh the Application, and read the digest off the live Deployment rather than off your own apply.
 
    ⚠ **Check which overlay the cluster is actually running before applying one.** They are not interchangeable, and the axis that matters is the database: `plain` carries `db-throwaway`, `gitops` carries `db-dataservice`. Applying `plain` over this deployment would repoint the forum at a different, empty database.
 
