@@ -127,11 +127,18 @@ CI rebuilds `ghcr.io/siliconsaga/xenforo-k8s` on every push to `image/`, and wee
 
    Routing is a weaker tell. An HTTPRoute does distinguish them, but *absence of an ExternalSecret* proves nothing — the gitops overlay deliberately dropped `secrets-openbao` once the DataService began owning the password, so neither flavor has one.
 
-   **Roll back by applying a known-good digest — not with `rollout undo`, which is actively wrong for this upgrade.** Revert step 3's commit and apply again through whichever path step 4 established.
+   **Roll back by writing a known-good digest into step 3's line and applying it** through whichever path step 4 established. Name the digest explicitly; do not reach for a command that means "whatever was here before".
 
-   `rollout undo` restores the *previous revision's pod spec*, and until this PR lands that spec is `ghcr.io/siliconsaga/xenforo-k8s:latest` with the default `imagePullPolicy: Always`. Undoing it therefore does not restore the old image at all: it pulls whatever `:latest` resolves to at that moment, which is the newest build — quite possibly the one you are rolling back from. It rolls *forward* under a reassuring name, and `rollout status` goes green either way. That is the same unreviewable-image problem this whole change exists to end, hiding in the rollback advice.
+   **Neither `rollout undo` nor `git revert` is that command, and for the same reason.** `rollout undo` restores the *previous revision's pod spec*; `git revert` on step 3's commit restores the *previous manifest*. Until a second pinned commit exists, both of those are `ghcr.io/siliconsaga/xenforo-k8s:latest` with the default `imagePullPolicy: Always` — so neither restores the old image at all. Each pulls whatever `:latest` resolves to at that moment, which is the newest build, quite possibly the one you are rolling back from. They roll *forward* under a reassuring name, and `rollout status` goes green either way. That is the same unreviewable-image problem this whole change exists to end, hiding in the rollback advice — and reverting the pin looks even safer than undoing it, which is what makes it worse.
 
-   Once two digest-pinned revisions exist in the Deployment's history, `kubectl -n xenforo rollout undo deploy/xenforo` becomes trustworthy again, because the previous spec then names an immutable image. Check with `kubectl -n xenforo rollout history deploy/xenforo` before relying on it.
+   Both become trustworthy once two digest-pinned revisions exist, because the thing they restore then names an immutable image. Check before relying on either:
+
+   ```bash
+   kubectl -n xenforo rollout history deploy/xenforo
+   git log --oneline -- kustomize/base/kustomization.yaml
+   ```
+
+   Until then, the digest you are rolling back *to* has to come from somewhere you can read it: that `git log`, the verification note in `kustomize/base/kustomization.yaml`, or `docker buildx imagetools inspect` against a tag you trust.
 
 Afterwards, confirm the volume's CA bundle survived the pod swap — it lives on the PVC and should, but that is the assumption worth testing rather than asserting:
 
