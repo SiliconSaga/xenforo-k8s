@@ -12,7 +12,7 @@ CI rebuilds `ghcr.io/siliconsaga/xenforo-k8s` on every push to `image/`, and wee
    docker buildx imagetools inspect ghcr.io/siliconsaga/xenforo-k8s:latest
    ```
 
-   The top-level `Digest:` is the one you want. This talks to the registry, not the local daemon, so it works even when Docker is unhealthy.
+   The top-level `Digest:` is the one you want, and it **already carries its `sha256:` prefix** — copy the whole value, because every placeholder below expects it. Pasting it after a second prefix gives `@sha256:sha256:…`, which fails as a malformed reference rather than as a missing image, so the error does not point at the typo. This talks to the registry, not the local daemon, so it works even when Docker is unhealthy.
 
 2. **Verify it before pinning it.** A green CI log says the build succeeded, not that the result is what you think. Check the three things that have actually gone wrong here — PHP version, CA package version, and whether the trust store rejects a known-bad chain.
 
@@ -62,7 +62,7 @@ CI rebuilds `ghcr.io/siliconsaga/xenforo-k8s` on every push to `image/`, and wee
    With Docker, run it on **both** architectures. The pin is the multi-arch index digest, so verifying only `linux/amd64` leaves the arm64 variant — the one a k3d dev cluster or an arm64 node resolves — entirely unchecked, and the two are separate builds that can differ:
 
    ```bash
-   D=ghcr.io/siliconsaga/xenforo-k8s@sha256:<digest-from-step-1>
+   D=ghcr.io/siliconsaga/xenforo-k8s@<digest-from-step-1>
    rc=0
    for p in linux/amd64 linux/arm64; do
      echo "== $p =="
@@ -78,20 +78,24 @@ CI rebuilds `ghcr.io/siliconsaga/xenforo-k8s` on every push to `image/`, and wee
    With no working Docker, run it as a throwaway pod on the digest — which also tests exactly what the cluster will pull. Note this covers only the **node's** architecture, so it verifies that cluster's variant rather than both:
 
    ```bash
-   kubectl -n xenforo run xf-image-probe --restart=Never \
-     --image=ghcr.io/siliconsaga/xenforo-k8s@sha256:<digest-from-step-1> \
-     --command -- sh -c "$(cat verify-image.sh)"
+   PROBE="xf-image-probe-$$"
+   kubectl -n xenforo run "$PROBE" --restart=Never \
+     --image=ghcr.io/siliconsaga/xenforo-k8s@<digest-from-step-1> \
+     --command -- sh -c "$(cat verify-image.sh)" \
+     || { echo "FATAL: could not create the probe pod" >&2; exit 1; }
 
    rc=0
-   kubectl -n xenforo wait --for=jsonpath='{.status.phase}'=Succeeded pod/xf-image-probe --timeout=180s || rc=$?
-   kubectl -n xenforo logs xf-image-probe
-   kubectl -n xenforo delete pod xf-image-probe
+   kubectl -n xenforo wait --for=jsonpath='{.status.phase}'=Succeeded "pod/$PROBE" --timeout=180s || rc=$?
+   kubectl -n xenforo logs "$PROBE"
+   kubectl -n xenforo delete pod "$PROBE"
    [ "$rc" = 0 ] || { echo "FATAL: probe never reached Succeeded (wait exit $rc)" >&2; exit 1; }
    ```
 
    The `wait` is load-bearing: `kubectl run --restart=Never` returns while the pod is still `Pending`, so reading logs immediately can fail before the container has started — and a failed `logs` call reads as a broken probe rather than a race. A non-`Succeeded` phase *is* the failure signal; the logs only tell you which branch tripped.
 
    **Save that status before reading the logs, and re-assert it afterwards.** The `logs` and `delete` that follow both succeed against a *failed* pod, so the block without `rc` ends on `delete`'s exit 0 and reports a vulnerable image as verified. Print the logs and clean up either way — you want the diagnosis, and you do not want a leftover pod — but let the saved status have the last word.
+
+   **The `$$` in the pod name, and the `||` on `run`, are both there to stop a *previous* probe from answering for this one.** With a fixed name, an interrupted run leaves `xf-image-probe` behind; the next `kubectl run` then fails with `AlreadyExists`, and `wait` goes on to find that leftover pod already `Succeeded` — on whatever digest it was built for. You get an instant green verdict about an image you never tested. A per-shell name means a leftover cannot be mistaken for the current run, and failing on `run` means a collision stops the block instead of handing it a stale answer.
 
    One more trap in the script above: `php -v | head -n1` would discard PHP's exit status, and chaining with `;` reports only the last command's. `set -eu` with unpiped commands is what makes a failure fail.
 
@@ -122,7 +126,11 @@ CI rebuilds `ghcr.io/siliconsaga/xenforo-k8s` on every push to `image/`, and wee
 
    Routing is a weaker tell. An HTTPRoute does distinguish them, but *absence of an ExternalSecret* proves nothing — the gitops overlay deliberately dropped `secrets-openbao` once the DataService began owning the password, so neither flavor has one.
 
-   Roll back by reverting the commit and applying again, or `kubectl -n xenforo rollout undo deploy/xenforo` for an immediate fix.
+   **Roll back by applying a known-good digest — not with `rollout undo`, which is actively wrong for this upgrade.** Revert step 3's commit and apply again through whichever path step 4 established.
+
+   `rollout undo` restores the *previous revision's pod spec*, and until this PR lands that spec is `ghcr.io/siliconsaga/xenforo-k8s:latest` with the default `imagePullPolicy: Always`. Undoing it therefore does not restore the old image at all: it pulls whatever `:latest` resolves to at that moment, which is the newest build — quite possibly the one you are rolling back from. It rolls *forward* under a reassuring name, and `rollout status` goes green either way. That is the same unreviewable-image problem this whole change exists to end, hiding in the rollback advice.
+
+   Once two digest-pinned revisions exist in the Deployment's history, `kubectl -n xenforo rollout undo deploy/xenforo` becomes trustworthy again, because the previous spec then names an immutable image. Check with `kubectl -n xenforo rollout history deploy/xenforo` before relying on it.
 
 Afterwards, confirm the volume's CA bundle survived the pod swap — it lives on the PVC and should, but that is the assumption worth testing rather than asserting:
 
