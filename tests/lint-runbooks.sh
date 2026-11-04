@@ -65,11 +65,14 @@ err_file="$(mktemp)"
 trap 'rm -f "$block_file" "$err_file"' EXIT
 
 # A fence opens with three or more backticks or three or more tildes, and the
-# first word after it is the language. Indentation is allowed freely rather
-# than CommonMark's three spaces, because every block in this repo's runbooks
-# is nested inside a numbered list and therefore starts at its list item's
-# content column.
-fence_re='^([[:space:]]*)(`{3,}|~{3,})[[:space:]]*([^[:space:]]*)'
+# first word of the info string that follows is the language. Indentation is
+# allowed freely rather than CommonMark's three spaces, because every block in
+# this repo's runbooks is nested inside a numbered list and therefore starts at
+# its list item's content column.
+#
+# The info string is captured whole, not just its first word, because its
+# contents decide whether this is a fence at all — see the backtick check below.
+fence_re='^([[:space:]]*)(`{3,}|~{3,})(.*)$'
 
 total=0
 bad=0
@@ -82,6 +85,8 @@ for md in "${files[@]}"; do
   fi
 
   in_block=0
+  in_comment=0
+  comment_start=0
   is_shell=0
   close_re=''
   start_line=0
@@ -99,9 +104,39 @@ for md in "${files[@]}"; do
     # made the next literal line (`if`, say) the first line of a phantom
     # script, and CI would report a syntax error in a perfectly good document.
     if (( in_block == 0 )); then
+      # Markdown treats an HTML comment's contents as literal text, fence
+      # markers included. A ```text inside one would otherwise open a block
+      # that runs to the next bare fence and swallows the real shell block in
+      # between — reported as nothing at all, which is the only kind of bug
+      # this script must never have.
+      if (( in_comment == 1 )); then
+        if [[ "$line" == *"-->"* ]]; then
+          in_comment=0
+        fi
+        continue
+      fi
+      if [[ "$line" == *"<!--"* && "$line" != *"-->"* ]]; then
+        in_comment=1
+        comment_start=$lineno
+        continue
+      fi
+
       if [[ "$line" =~ $fence_re ]]; then
         marker="${BASH_REMATCH[2]}"
-        lang="$(printf '%s' "${BASH_REMATCH[3]}" | tr 'A-Z' 'a-z')"
+        info="${BASH_REMATCH[3]}"
+
+        # A backtick fence's info string cannot contain a backtick (CommonMark
+        # 4.5), so ```text``` on its own line is an inline code span in a
+        # sentence, not an opener. Taken as one it would swallow whatever
+        # followed, the same false pass as the HTML comment above.
+        if [[ "${marker:0:1}" == '`' && "$info" == *'`'* ]]; then
+          continue
+        fi
+
+        # First word of the info string, lowercased. Leading space is trimmed
+        # first so that ``` bash is read the same as ```bash.
+        info="${info#"${info%%[![:space:]]*}"}"
+        lang="$(printf '%s' "${info%%[[:space:]]*}" | tr 'A-Z' 'a-z')"
 
         # The closing fence must use the opener's character and be at least as
         # long (CommonMark 4.5), which is what lets a block containing ``` be
@@ -165,6 +200,18 @@ for md in "${files[@]}"; do
     # pass there would be the worst outcome this script has.
     echo "FAIL $md:$start_line"
     echo "    unterminated fence — the block never closes"
+    bad=$((bad + 1))
+    file_bad=$((file_bad + 1))
+    file_blocks=$((file_blocks + 1))
+    total=$((total + 1))
+  fi
+
+  if (( in_comment == 1 )); then
+    # Skipping a comment's contents is only safe if the comment ends. One that
+    # does not has hidden every block after it from this check, so it is a
+    # failure for the same reason an unterminated fence is.
+    echo "FAIL $md:$comment_start"
+    echo "    unterminated HTML comment — every block after it was skipped"
     bad=$((bad + 1))
     file_bad=$((file_bad + 1))
     file_blocks=$((file_blocks + 1))
