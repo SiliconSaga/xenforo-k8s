@@ -64,6 +64,13 @@ block_file="$(mktemp)"
 err_file="$(mktemp)"
 trap 'rm -f "$block_file" "$err_file"' EXIT
 
+# A fence opens with three or more backticks or three or more tildes, and the
+# first word after it is the language. Indentation is allowed freely rather
+# than CommonMark's three spaces, because every block in this repo's runbooks
+# is nested inside a numbered list and therefore starts at its list item's
+# content column.
+fence_re='^([[:space:]]*)(`{3,}|~{3,})[[:space:]]*([^[:space:]]*)'
+
 total=0
 bad=0
 checked_files=0
@@ -75,29 +82,54 @@ for md in "${files[@]}"; do
   fi
 
   in_block=0
+  is_shell=0
+  close_re=''
   start_line=0
   : >"$block_file"
   file_blocks=0
   file_bad=0
   lineno=0
 
-  # The fence language decides whether a block is shell at all. ```text and
-  # ```yaml blocks hold measured output and manifests, and feeding those to
-  # bash -n would produce failures that mean nothing.
   while IFS= read -r line || [[ -n "$line" ]]; do
     lineno=$((lineno + 1))
 
+    # EVERY fence is tracked, not just shell ones. Inside a ```text block —
+    # and this repo has several, holding measured kubectl transcripts — a line
+    # reading ```bash is literal content, not an opener. Treating it as one
+    # made the next literal line (`if`, say) the first line of a phantom
+    # script, and CI would report a syntax error in a perfectly good document.
     if (( in_block == 0 )); then
-      if [[ "$line" =~ ^[[:space:]]*\`\`\`(bash|sh|shell)[[:space:]]*$ ]]; then
+      if [[ "$line" =~ $fence_re ]]; then
+        marker="${BASH_REMATCH[2]}"
+        lang="$(printf '%s' "${BASH_REMATCH[3]}" | tr 'A-Z' 'a-z')"
+
+        # The closing fence must use the opener's character and be at least as
+        # long (CommonMark 4.5), which is what lets a block containing ``` be
+        # fenced with ````. Matching any ``` would end such a block early, and
+        # matching only the exact opener would call it unterminated.
+        close_re="^[[:space:]]*${marker:0:1}{${#marker},}[[:space:]]*$"
+
         in_block=1
         start_line=$((lineno + 1))
         : >"$block_file"
+
+        case "$lang" in
+          bash|sh|shell) is_shell=1 ;;
+          *)             is_shell=0 ;;
+        esac
       fi
       continue
     fi
 
-    if [[ "$line" =~ ^[[:space:]]*\`\`\`[[:space:]]*$ ]]; then
+    if [[ "$line" =~ $close_re ]]; then
       in_block=0
+
+      # A non-shell block is tracked only so its contents are skipped; it is
+      # not a block this check has an opinion about.
+      if (( is_shell == 0 )); then
+        continue
+      fi
+
       total=$((total + 1))
       file_blocks=$((file_blocks + 1))
 
@@ -121,14 +153,18 @@ for md in "${files[@]}"; do
       continue
     fi
 
-    printf '%s\n' "$line" >>"$block_file"
+    if (( is_shell == 1 )); then
+      printf '%s\n' "$line" >>"$block_file"
+    fi
   done <"$md"
 
   if (( in_block == 1 )); then
-    # An unterminated fence is a documentation bug of its own, and it means
-    # everything after it rendered as code.
+    # An unterminated fence is a documentation bug of its own, and it is
+    # reported whatever the language: everything after it rendered as code, and
+    # every shell block that followed was swallowed and never checked. A silent
+    # pass there would be the worst outcome this script has.
     echo "FAIL $md:$start_line"
-    echo "    unterminated \`\`\` fence — the block never closes"
+    echo "    unterminated fence — the block never closes"
     bad=$((bad + 1))
     file_bad=$((file_bad + 1))
     file_blocks=$((file_blocks + 1))
