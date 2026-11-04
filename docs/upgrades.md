@@ -23,8 +23,25 @@ CI rebuilds `ghcr.io/siliconsaga/xenforo-k8s` on every push to `image/`, and wee
    ```sh
    # verify-image.sh — exits 0 only if this image is safe to pin.
    set -eu
-   php -v
-   apk list --installed ca-certificates
+
+   # Floors, not just printouts. Echoing a version proves nothing: an image can
+   # print PHP 8.4.26 and still pass a TLS probe, and 8.4.26 is the
+   # unauthenticated-RCE build (CVE-2026-109618/109619). Bump these together
+   # with ARG CA_CERTIFICATES_MIN in image/Dockerfile.
+   PHP_FLOOR=8.4.27
+   CA_FLOOR=20261020-r0
+
+   php_have="$(php -r 'echo PHP_VERSION;')"
+   echo "php: $php_have (floor $PHP_FLOOR)"
+   php -r "exit(version_compare(PHP_VERSION, '$PHP_FLOOR', '>=') ? 0 : 1);" \
+     || { echo "FATAL: PHP $php_have is below the $PHP_FLOOR floor" >&2; exit 1; }
+
+   # apk's own comparator, same as the Dockerfile's floor check — busybox sort
+   # has no reliable -V, and these versions are not plain semver.
+   ca_have="$(apk list --installed ca-certificates | head -n1 | cut -d' ' -f1 | sed 's/^ca-certificates-//')"
+   echo "ca-certificates: $ca_have (floor $CA_FLOOR)"
+   [ "$(apk version -t "$ca_have" "$CA_FLOOR")" != "<" ] \
+     || { echo "FATAL: ca-certificates $ca_have is below the $CA_FLOOR floor" >&2; exit 1; }
 
    # Negative control: this host serves a chain built on one of the recoverable
    # eMudhra keys, so a trustworthy store MUST refuse it.
@@ -42,14 +59,19 @@ CI rebuilds `ghcr.io/siliconsaga/xenforo-k8s` on every push to `image/`, and wee
 
    **Read the exit code precisely; "curl failed" is not "the chain was rejected."** DNS failure, blocked egress and timeouts all exit non-zero too, so a plain `if curl ...; then fail; fi` passes a *vulnerable* image whenever the probe simply never got through. Only exit 60 with `ssl_verify_result=20` is a rejection; everything else is no verdict, and no verdict must fail the check. This is the same three-way logic as `scripts/refresh-ca-bundle.sh`, for the same reason — and it has been got wrong here more than once.
 
-   With Docker:
+   With Docker, run it on **both** architectures. The pin is the multi-arch index digest, so verifying only `linux/amd64` leaves the arm64 variant — the one a k3d dev cluster or an arm64 node resolves — entirely unchecked, and the two are separate builds that can differ:
 
    ```bash
    D=ghcr.io/siliconsaga/xenforo-k8s@sha256:<digest-from-step-1>
-   docker run --rm --platform linux/amd64 "$D" sh -c "$(cat verify-image.sh)"
+   for p in linux/amd64 linux/arm64; do
+     echo "== $p =="
+     docker run --rm --platform "$p" "$D" sh -c "$(cat verify-image.sh)"
+   done
    ```
 
-   With no working Docker, run it as a throwaway pod on the digest — which also tests exactly what the cluster will pull:
+   The non-native one runs under QEMU and is slower, but it is the same assertion. `set -e` in your shell, or checking the loop's exit, keeps a failure from scrolling past.
+
+   With no working Docker, run it as a throwaway pod on the digest — which also tests exactly what the cluster will pull. Note this covers only the **node's** architecture, so it verifies that cluster's variant rather than both:
 
    ```bash
    kubectl -n xenforo run xf-image-probe --restart=Never \
