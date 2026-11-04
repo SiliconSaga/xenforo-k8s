@@ -192,11 +192,15 @@ XenForo upgrades are file-replacement plus a schema migration, and both happen a
    ```bash
    gunzip -k xenforo-<stamp>.sql.gz
    tail -5 xenforo-<stamp>.sql          # `-- Dump completed` must be present
-   docker compose -f docker/compose.yaml up -d db
+   docker compose -f docker/compose.yaml up -d --wait db
    docker compose -f docker/compose.yaml cp xenforo-<stamp>.sql db:/tmp/dump.sql
-   docker compose -f docker/compose.yaml exec -e MYSQL_PWD="$XF_DB_PASSWORD" db \
-     mysql -u xenforo xenforo -e "source /tmp/dump.sql"
+   docker compose -f docker/compose.yaml exec db sh -c \
+     'MYSQL_PWD="$MYSQL_PASSWORD" mysql -u "$MYSQL_USER" "$MYSQL_DATABASE" -e "source /tmp/dump.sql"'
    ```
+
+   **`--wait`, because `up -d` returns when the container is *started*, not when MySQL is accepting connections.** The `db` service declares a healthcheck precisely so something can wait on it; `--wait` is what consumes it. Without it the `cp` usually survives and the import races initialisation, which fails in a way that looks like a bad dump rather than a bad sequence.
+
+   **Resolve the password inside the container, not on your command line.** `-e MYSQL_PWD="$XF_DB_PASSWORD"` expands in your shell, so the credential lands in the host's process arguments where any local process can read it from `ps`. The `db` container already holds `MYSQL_PASSWORD`, `MYSQL_USER` and `MYSQL_DATABASE` from compose, so single-quoting the `sh -c` body defers expansion to the container and nothing crosses the boundary. (The nightly CronJob goes one better with a `--defaults-extra-file`, keeping the password out of the *container's* argv too; that is worth the extra lines for a recurring job and not for a throwaway rehearsal, but it is the stronger form if you copy this pattern somewhere durable.)
 
    Address the stack by **compose file and service name**, never by container name. `docker-db-1` is a *generated* name: it is the project name plus the service plus an index, and the project name defaults to the containing directory — so it is `docker-db-1` only while you happen to be standing in `docker/`. Run the same `docker cp` from the component root, or under a `-p` flag, or alongside a second copy of the stack, and it addresses nothing or the wrong thing. `-f docker/compose.yaml` also lets every command in this runbook be pasted from one directory.
 
@@ -269,7 +273,10 @@ XenForo upgrades are file-replacement plus a schema migration, and both happen a
 
    ```bash
    kubectl -n xenforo rollout restart deploy/xenforo
+   kubectl -n xenforo rollout status deploy/xenforo --timeout=300s
    ```
+
+   The `rollout status` is part of the step, not a flourish. `rollout restart` returns as soon as the Deployment is updated, and this Deployment is **`Recreate`** (a rolling update would try to attach the same RWO volume twice) — so for a few seconds the only pod in the namespace is `Terminating`, and shortly after that the only pod is `Pending`. Step 7 runs against whichever pod it finds.
 
 7. **Refresh XenForo's CA bundle** — the upgrade just overwrote it with the release's snapshot:
 
@@ -277,6 +284,8 @@ XenForo upgrades are file-replacement plus a schema migration, and both happen a
    scripts/refresh-ca-bundle.sh --check   # expect exit 1, "stale: refresh needed"
    scripts/refresh-ca-bundle.sh
    ```
+
+   ⚠ **Do not start this before the rollout above has settled.** `refresh-ca-bundle.sh` selects the first matching pod and `exec`s into it; against a `Terminating` or `Pending` pod that fails, and the failure reads as a broken script rather than a mistimed one. The script trusts its caller on this — it does not wait for readiness itself — so the `rollout status` in step 6 is what makes step 7 deterministic.
 
    This is not precautionary. Measured inside the 2.3.13 container on 2026-11-04, against the same host, in the same shell:
 
