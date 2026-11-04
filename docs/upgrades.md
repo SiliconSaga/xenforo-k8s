@@ -55,22 +55,49 @@ CI rebuilds `ghcr.io/siliconsaga/xenforo-k8s` on every push to `image/`, and wee
    esac
    [ "$verify" = 20 ] || { echo "FATAL: rejected, but ssl_verify_result=$verify (expected 20)" >&2; exit 1; }
    echo "OK: compromised chain rejected (exit 60, verify 20)"
+
+   # Positive control, and the reason it is not optional: a store that trusts
+   # NOTHING rejects the host above too, so the negative control alone passes an
+   # image whose CA bundle cannot validate anything at all. Read the exit code
+   # here as well rather than using `curl -f` — -f fails on any HTTP status, and
+   # a 403 from a bot-blocking edge says nothing about the handshake.
+   rc=0
+   curl -sS --max-time 20 -o /dev/null https://accounts.google.com/ || rc=$?
+   case "$rc" in
+     0)  ;;  # the handshake completed, which is the whole claim
+     60) echo "FATAL: trust store REJECTS legitimate TLS" >&2; exit 1 ;;
+     *)  echo "FATAL: no verdict on the positive control (curl exit $rc)" >&2; exit 1 ;;
+   esac
+   echo "OK: legitimate chain still validates"
    ```
 
    **Read the exit code precisely; "curl failed" is not "the chain was rejected."** DNS failure, blocked egress and timeouts all exit non-zero too, so a plain `if curl ...; then fail; fi` passes a *vulnerable* image whenever the probe simply never got through. Only exit 60 with `ssl_verify_result=20` is a rejection; everything else is no verdict, and no verdict must fail the check. This is the same three-way logic as `scripts/refresh-ca-bundle.sh`, for the same reason — and it has been got wrong here more than once.
+
+   **Both controls, for the same reason that script runs both.** `check_bundle` proves the compromised chain is refused; `expect_accept` proves a legitimate one still validates, because — in that file's own words — "a bundle which rejects everything would sail through the negative controls." A store with no roots at all answers exit 60 / verify 20 to *every* host, which is indistinguishable from a correct refusal if refusal is all you ask about.
 
    With Docker, run it on **both** architectures. The pin is the multi-arch index digest, so verifying only `linux/amd64` leaves the arm64 variant — the one a k3d dev cluster or an arm64 node resolves — entirely unchecked, and the two are separate builds that can differ:
 
    ```bash
    DIGEST=sha256:...        # the index digest from step 1
    D="ghcr.io/siliconsaga/xenforo-k8s@$DIGEST"
+
+   # Read the script ONCE, and refuse to run on nothing: `sh -c ""` exits 0, so
+   # a verify-image.sh that is missing, unreadable or empty reports every
+   # architecture as verified. Measured — `docker run ... sh -c "$(cat
+   # no-such-file)"` exits 0.
+   VERIFY=$(cat verify-image.sh) \
+     || { echo "FATAL: cannot read verify-image.sh" >&2; exit 1; }
+   [ -n "$VERIFY" ] || { echo "FATAL: verify-image.sh is empty; nothing would be checked" >&2; exit 1; }
+
    rc=0
    for p in linux/amd64 linux/arm64; do
      echo "== $p =="
-     docker run --rm --platform "$p" "$D" sh -c "$(cat verify-image.sh)" || rc=1
+     docker run --rm --platform "$p" "$D" sh -c "$VERIFY" || rc=1
    done
    [ "$rc" = 0 ] || { echo "FATAL: an architecture failed verification" >&2; exit 1; }
    ```
+
+   **The `VERIFY` guard is the same shape as everything else on this page: a check that cannot fail is worse than no check.** `cat` on a missing file writes to stderr and yields an empty string, the command substitution swallows its status, and `sh -c ""` is a successful program that examined nothing. The image is then pinned on the strength of a script you never saved.
 
    The non-native one runs under QEMU and is slower, but it is the same assertion.
 
@@ -79,9 +106,19 @@ CI rebuilds `ghcr.io/siliconsaga/xenforo-k8s` on every push to `image/`, and wee
    With no working Docker, run it as a throwaway pod on the digest — which also tests exactly what the cluster will pull. **Probe once per architecture the cluster can schedule on, and pin each probe to one.** An unpinned pod lands wherever the scheduler puts it, so on a mixed-arch cluster it can verify one variant while `deploy/xenforo` later pulls the other — a green check on an image the forum never runs. Read the list off the nodes rather than naming it, because the base Deployment sets no `nodeSelector` and no affinity, so every node is eligible:
 
    ```bash
+   VERIFY=$(cat verify-image.sh) \
+     || { echo "FATAL: cannot read verify-image.sh" >&2; exit 1; }
+   [ -n "$VERIFY" ] || { echo "FATAL: verify-image.sh is empty; nothing would be checked" >&2; exit 1; }
+
+   # Not one pipeline: `kubectl ... | sort -u` reports SORT's status, and sort
+   # succeeds on no input, so a Forbidden or unreachable node query would leave
+   # ARCHES empty, run zero probes, and exit 0. Measured, with a kubectl that
+   # exits 1: probes run 0, verdict verified.
    ARCHES=$(kubectl get nodes \
-     -o jsonpath='{range .items[*]}{.metadata.labels.kubernetes\.io/arch}{"\n"}{end}' \
-     | sort -u)
+     -o jsonpath='{range .items[*]}{.metadata.labels.kubernetes\.io/arch}{"\n"}{end}') \
+     || { echo "FATAL: could not list nodes; set ARCHES by hand (below)" >&2; exit 1; }
+   ARCHES=$(printf '%s\n' "$ARCHES" | sort -u)
+   [ -n "$ARCHES" ] || { echo "FATAL: no node architectures; refusing to verify nothing" >&2; exit 1; }
    echo "probing: $ARCHES"
 
    rc=0
@@ -90,7 +127,7 @@ CI rebuilds `ghcr.io/siliconsaga/xenforo-k8s` on every push to `image/`, and wee
      kubectl -n xenforo run "$PROBE" --restart=Never \
        --image="ghcr.io/siliconsaga/xenforo-k8s@$DIGEST" \
        --overrides="{\"spec\":{\"nodeSelector\":{\"kubernetes.io/arch\":\"$ARCH\"}}}" \
-       --command -- sh -c "$(cat verify-image.sh)" \
+       --command -- sh -c "$VERIFY" \
        || { echo "FATAL: could not create the $ARCH probe pod" >&2; exit 1; }
 
      wait_rc=0
@@ -102,7 +139,13 @@ CI rebuilds `ghcr.io/siliconsaga/xenforo-k8s` on every push to `image/`, and wee
    [ "$rc" = 0 ] || { echo "FATAL: an architecture probe failed" >&2; exit 1; }
    ```
 
-   On this cluster that loop runs exactly once — all six nodes are `amd64` as of 2026-11-04 — so the single-arch case is the normal one and the loop costs nothing. It is written this way so that adding an arm64 node pool does not silently halve the check.
+   **`nodes` is a cluster-scoped read, so expect `Forbidden` rather than an answer** if you hold the namespace-scoped access [`README.md`](../README.md) hands out — which is the common case for anyone who is not the cluster admin. That is a normal reply, not a broken cluster, and the guard above turns it into a stop rather than a pass. Name the architectures yourself and carry on:
+
+   ```bash
+   ARCHES=amd64        # or 'amd64 arm64' — what you know the cluster runs
+   ```
+
+   On this cluster the loop runs exactly once — all six nodes are `amd64` as of 2026-11-04 — so the single-arch case is the normal one and the loop costs nothing. It is written this way so that adding an arm64 node pool does not silently halve the check.
 
    **The `--overrides` merge is additive, which is the only reason this is one flag rather than a hand-written Pod.** Measured on docker-desktop: the override lands `spec.nodeSelector` and leaves the `--image` and `--command` that `kubectl run` generated untouched. An architecture no node offers also fails closed rather than passing — the pod stays `Pending`, and `wait` exits non-zero when the timeout runs out — which is the other reason to read `ARCHES` off the cluster instead of typing it in.
 
@@ -378,6 +421,9 @@ EOF
    Compare the two sizes it just printed, then extract:
 
    ```bash
+   # tar -C will not create this, and docker/xf is gitignored — on a workstation
+   # that has only ever run the Kubernetes flavor it does not exist yet.
+   mkdir -p docker/xf
    tar -xzf ./xf-code.tgz -C docker/xf \
      || { echo "FATAL: extract failed; docker/xf is a mixture now, delete it" >&2; exit 1; }
    mkdir -p docker/xf/data docker/xf/internal_data
@@ -390,7 +436,13 @@ EOF
    Restore the dump with MySQL's own `source`, which needs no shell pipeline:
 
    ```bash
-   DUMP=xenforo-pre-2313-20261104-160000     # the local file step 1 left, either overlay
+   # Derived from $RUN, never typed: a literal name is how you end up rehearsing
+   # against an older dump, which decompresses, carries its footer, validates
+   # perfectly, and is the wrong database.
+   : "${RUN:?set RUN to the value step 1 used, e.g. 2313-20261104-160000}"
+   DUMP="xenforo-pre-$RUN"
+   [ -f "$DUMP.sql.gz" ] \
+     || { echo "FATAL: no $DUMP.sql.gz here; step 1 did not leave one" >&2; exit 1; }
 
    # gunzip refuses to clobber, so a leftover .sql from a previous attempt makes
    # this exit non-zero and leaves the OLD dump in place for the import below.
@@ -406,6 +458,8 @@ EOF
        'MYSQL_PWD="$MYSQL_PASSWORD" mysql -u "$MYSQL_USER" "$MYSQL_DATABASE" -e "source /tmp/dump.sql"' \
      || { echo "FATAL: the import did not complete; this database is not the forum" >&2; exit 1; }
    ```
+
+   **`RUN` is set in step 1, and step 2 is often a different shell** — a day later, a new terminal, after a reboot. `${RUN:?}` says so out loud instead of quietly building `xenforo-pre-.sql.gz`, and the `-f` test is the backstop, because an interactive shell survives a `:?` and carries on to the next line.
 
    **`tail -5` was a thing to look at, not a check, and that is the difference that matters here.** The footer either is or is not there, and the answer decides whether the next command should run at all — so it is a `grep -q` with a guard on it, like every other instance of this check in this document. Printing five lines for a human to read is the same shape as printing a `wait` result instead of saving it: correct right up until the one time nobody looks.
 
@@ -497,7 +551,21 @@ EOF
 
    `config.php` needs no special case under this scheme — `644` falls out of the code rule, and the code rule is the right one for it: it is application code, and it does **not** hold the database password. The image generates it from the environment, and `getenv_docker()` resolves `XF_DB_PASSWORD_FILE` to the mounted secret at runtime (`image/config.php:45`), so the credential is never written into the file to be protected in the first place. Under the older blanket `664` it had to be clawed back by hand, which is a good sign the blanket was wrong.
 
-   ⚠ **This is stricter than what the live tree inherited.** As of 2026-11-04 the deployed forum carries `drwxrwsr-x root:www-data` on code — group-writable — because that is how the original install was seeded and the 2.3.13 upgrade faithfully restored it. The three writable paths were already correct and `www-data`-owned, so tightening the rest is a contained change rather than a redesign; it is listed here because the runbook should stop propagating the looser form, and applying it to the running forum is a deliberate step to take on its own, with a Velero snapshot in hand, not folded into an upgrade.
+   ⚠ **The *modes* above do not survive the next pod start, and no runbook step can make them.** `base/deployment.yaml` sets `fsGroup: 82` with the default `fsGroupChangePolicy`, so kubelet walks the whole volume at every mount and ORs `g+rw` into every file and `g+rwx` plus setgid into every directory. A `644` file is `664` again before php-fpm serves its first request — step 6's restart is enough to undo this chmod, and this document said the opposite until Copilot pointed it out.
+
+   Read off the live forum on 2026-11-04, which is what makes it more than a reading of the API docs:
+
+   ```text
+   2775 UNKNOWN:www-data  /var/www/html
+    664 root:www-data     /var/www/html/index.php
+   2775 root:www-data     /var/www/html/src
+    664 root:www-data     /var/www/html/src/XF.php
+   2775 www-data:www-data /var/www/html/internal_data
+   ```
+
+   The volume root is still owned by the *workstation* uid that `kubectl cp` left — `UNKNOWN` because no such user exists in the container — while its group is `www-data`. That combination is only what `chown(-1, fsGroup)` produces: uid untouched, gid forced to 82. So the group-write on code was never "how the install was seeded"; it is re-created on every mount, which also explains why the `drwxr-xr-x 502 wheel` recorded right after the 2.3.13 extract is not what the tree reads today. (That the volume root alone kept the foreign uid is the derived `$CODE` list behaving as designed — `.` was never in it.)
+
+   **So run the block for the ownership, and do not count on the modes.** `chown` is the half that persists: `fsGroup` never touches uid, and it sets exactly the gid the code rule wants anyway. Making code durably non-writable by php-fpm is a *manifest* change, not a runbook step — either `fsGroupChangePolicy: OnRootMismatch`, which skips the recursive walk once the volume root already matches and so leaves inner modes alone, or dropping `fsGroup` and having the init container chown the three writable paths itself. Both are deliberate changes to how a live forum's volume is owned, to make with a Velero snapshot in hand and on their own, not folded into an upgrade.
 
    `COPYFILE_DISABLE=1` is a macOS detail: without it `tar` embeds AppleDouble xattrs and busybox in the pod prints one `Ignoring unknown extended header keyword` line per file, burying any real error in thousands of lines of noise.
 
