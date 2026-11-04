@@ -142,31 +142,108 @@ scripts/refresh-ca-bundle.sh --check
 
 XenForo upgrades are file-replacement plus a schema migration, and both happen against the volume.
 
-1. **Back up first.** The database and the volume, together — a half-migrated forum needs both to roll back.
+1. **Back up first, and verify both halves.** A half-migrated forum needs the database *and* the volume to roll back.
+
+   A nightly `xenforo-db-backup` CronJob already exists with 14-day retention, so take a fresh run of it rather than hand-rolling a dump. It carries the `--set-gtid-purged=OFF` and `--no-tablespaces` flags a vended DataService tenant needs, and it verifies its own output — `gzip -t` plus mysqldump's `-- Dump completed` footer — before publishing the file under its real name:
 
    ```bash
-   kubectl -n xenforo exec deploy/xenforo-db -- \
-     mysqldump -u xenforo -p"$(...)" xenforo > xenforo-$(date +%F).sql
+   kubectl -n xenforo create job xenforo-db-pre-<version> --from=cronjob/xenforo-db-backup
+   kubectl -n xenforo wait --for=condition=Complete job/xenforo-db-pre-<version> --timeout=300s
+   kubectl -n xenforo logs job/xenforo-db-pre-<version>
    ```
 
-2. **Rehearse in the Docker flavor.** Point `docker/xf` at a copy of the tree, restore the dump into the compose database, run the upgrade there first. This is the main reason flavor 1 exists.
+   ⚠ **Do not reach for `kubectl exec deploy/xenforo-db -- mysqldump`.** That is the *plain* flavor, and this document said so for longer than it should have. On the **gitops** overlay there is no `xenforo-db` Deployment at all — the database is mimir's shared MySQL, reached through the `xenforo-db-dataservice` Secret — so the command fails with `deployments.apps "xenforo-db" not found`, which reads like "backups are impossible here" rather than "wrong flavor".
 
-3. **Put the forum in maintenance mode** from the admin control panel, or accept errors during the migration.
+   The volume is the other half, and the `.sql.gz` does **not** contain it: `internal_data/` holds the attachments. Velero snapshots it:
 
-4. **Copy the new files in**, over the top of the existing tree:
+   ```bash
+   velero backup create xenforo-pre-<version> --include-namespaces xenforo --snapshot-volumes
+   ```
+
+   Check the snapshot *count*, not just the phase — a backup that captured metadata and no volumes also reports `Completed`:
+
+   ```bash
+   kubectl -n velero get backups.velero.io xenforo-pre-<version> \
+     -o custom-columns='PHASE:.status.phase,TRIED:.status.volumeSnapshotsAttempted,DONE:.status.volumeSnapshotsCompleted'
+   ```
+
+   For the 2.3.13 upgrade that read `Completed / 2 / 2` — both `xenforo-data` and `xenforo-backups`, zero errors.
+
+2. **Rehearse in the Docker flavor, against the real data.** This is the main reason flavor 1 exists, and it costs a few minutes if you skip what the migration cannot touch.
+
+   **Skip `internal_data/`.** It was 855MB of a 1.0GB tree and holds attachments and caches the schema migration never reads. Tar the remainder in the pod and copy one file out, rather than `kubectl cp`-ing a directory:
 
    ```bash
    POD=$(kubectl -n xenforo get pod -l app=xenforo -o name)
-   kubectl -n xenforo cp ./xenforo-2.3.y/. "${POD#pod/}":/var/www/html -c php-fpm
+   POD=${POD#pod/}
+   kubectl -n xenforo exec "$POD" -c php-fpm -- \
+     tar -czf /tmp/xf-code.tgz -C /var/www/html --exclude=./internal_data --exclude=./data .
+   kubectl -n xenforo cp "$POD:/tmp/xf-code.tgz" ./xf-code.tgz -c php-fpm --retries=5
+   gzip -t ./xf-code.tgz
+   tar -xzf ./xf-code.tgz -C docker/xf
+   mkdir -p docker/xf/data docker/xf/internal_data
    ```
 
-   XenForo release archives are meant to be unpacked over an existing install. Do not delete the tree first — `internal_data/` and `data/` hold your attachments.
+   **`--retries` is load-bearing and the byte count is how you check it.** A first attempt without it died with `error: unexpected EOF`, and the dump copy below visibly resumed mid-file (`Resuming copy at 21573632 bytes, retry 1/5`). Compare the local size against the in-pod `ls -l` every time, then `gzip -t`.
+
+   Restore the dump with MySQL's own `source`, which needs no shell pipeline:
+
+   ```bash
+   gunzip -k xenforo-<stamp>.sql.gz
+   tail -5 xenforo-<stamp>.sql          # `-- Dump completed` must be present
+   docker compose up -d db
+   docker cp xenforo-<stamp>.sql docker-db-1:/tmp/dump.sql
+   docker exec -e MYSQL_PWD="$XF_DB_PASSWORD" docker-db-1 \
+     mysql -u xenforo xenforo -e "source /tmp/dump.sql"
+   ```
+
+   **Rehearse on the pinned image, not a local build.** `docker compose build` takes ~25 minutes; tagging the digest the cluster actually runs takes seconds and is strictly better fidelity:
+
+   ```bash
+   docker pull ghcr.io/siliconsaga/xenforo-k8s@<digest-from-kustomization>
+   docker tag  ghcr.io/siliconsaga/xenforo-k8s@<digest-from-kustomization> xenforo-k8s:local
+   docker compose up -d --no-build xenforo caddy
+   ```
+
+   Unpack the release's `upload/` over `docker/xf/`, run `php cmd.php xf:upgrade --no-interaction --skip-statistics`, and confirm the forum renders on `http://localhost:8080/` before going near the cluster.
+
+   **Compare raw row counts, not the forum's own figures.** `xf_user`, `xf_post`, `xf_thread`, `xf_attachment` and `xf_template` must be identical across the migration. The rendered stat block is filtered and will not show you a loss — it reported 2,965 "Members" against 29,026 rows in `xf_user`, because the difference is unconfirmed and rejected registrations.
+
+3. **Put the forum in maintenance mode** from the admin control panel, or accept errors during the migration. The window is short — both 2.3.13 migration steps finished in well under a minute on a 16.5k-post database — so for a forum that is not yet the public hostname this step is a judgement call rather than a requirement. Check what `kubectl -n xenforo get httproute` answers before deciding.
+
+4. **Copy the new files in**, over the top of the existing tree. Release archives nest everything under `upload/`, so strip that level; and tar one file in rather than `cp`-ing a directory, which is both faster and far less likely to truncate:
+
+   ```bash
+   COPYFILE_DISABLE=1 tar -czf xf-new.tgz -C ./xenforo-2.3.y/upload .
+   kubectl -n xenforo cp ./xf-new.tgz "$POD:/tmp/xf-new.tgz" -c php-fpm --retries=5
+   kubectl -n xenforo exec "$POD" -c php-fpm -- ls -l /tmp/xf-new.tgz   # byte-compare
+   kubectl -n xenforo exec "$POD" -c php-fpm -- gzip -t /tmp/xf-new.tgz
+   kubectl -n xenforo exec "$POD" -c php-fpm -- tar -xzf /tmp/xf-new.tgz -C /var/www/html
+   ```
+
+   XenForo release archives are meant to be unpacked over an existing install. Do not delete the tree first — `internal_data/` and `data/` hold your attachments, and `src/config.php` is not in the archive, so an overlay leaves it alone. Confirm that last point rather than trust it; without `config.php` the forum cannot reach its database at all.
+
+   ⚠ **Fix ownership afterwards — the tarball does not save you from this, it only moves it.** `kubectl cp` lands files as your *local* uid/gid, and `tar` run as root faithfully restores whatever uid/gid the archive recorded, so a tarball built on a workstation extracts as that workstation's user. After the 2.3.13 extract the tree read `502 wheel` with the setgid bit and group-write gone (`drwxr-xr-x` where it had been `drwxrwsr-x`). The forum still *served*, because `other` keeps read — which is exactly why this is easy to miss. The convention is `root:www-data`, `2775` on directories and `664` on files, so that the ACP can write as `www-data`:
+
+   ```bash
+   kubectl -n xenforo exec "$POD" -c php-fpm -- chown -R root:www-data <extracted paths>
+   kubectl -n xenforo exec "$POD" -c php-fpm -- find <extracted dirs> -type d -exec chmod 2775 {} +
+   kubectl -n xenforo exec "$POD" -c php-fpm -- find <extracted dirs> -type f -exec chmod 664 {} +
+   kubectl -n xenforo exec "$POD" -c php-fpm -- chmod 644 /var/www/html/src/config.php
+   ```
+
+   Leave `internal_data/` and `data/` out of the chown — they are `www-data:www-data` by design. And put `config.php` back to `644` explicitly: it holds the database password, so it should not pick up group-write from a blanket `find` over `src/`.
+
+   `COPYFILE_DISABLE=1` is a macOS detail: without it `tar` embeds AppleDouble xattrs and busybox in the pod prints one `Ignoring unknown extended header keyword` line per file, burying any real error in thousands of lines of noise.
 
 5. **Run the migration:**
 
    ```bash
-   kubectl -n xenforo exec deploy/xenforo -c php-fpm -- php cmd.php xf:upgrade
+   kubectl -n xenforo exec deploy/xenforo -c php-fpm -- \
+     php /var/www/html/cmd.php xf:upgrade --no-interaction --skip-statistics
    ```
+
+   It prints `Current version:` from the **database** and `Upgrade target:` from `src/XF.php`, which is the clearest confirmation that step 4 actually landed. Re-running it once the versions match is safe — it degrades to a template and phrase rebuild rather than re-applying steps.
 
 6. **Restart** so opcache and the template cache are rebuilt cleanly:
 
@@ -177,8 +254,20 @@ XenForo upgrades are file-replacement plus a schema migration, and both happen a
 7. **Refresh XenForo's CA bundle** — the upgrade just overwrote it with the release's snapshot:
 
    ```bash
+   scripts/refresh-ca-bundle.sh --check   # expect exit 1, "stale: refresh needed"
    scripts/refresh-ca-bundle.sh
    ```
+
+   This is not precautionary. Measured inside the 2.3.13 container on 2026-11-04, against the same host, in the same shell:
+
+   | trust store | result |
+   | --- | --- |
+   | system store (patched image) | exit 60, `verify=20` — **rejected** |
+   | `src/XF/Http/ca-bundle.crt` as shipped in 2.3.13 | exit 0, `verify=0`, `code=200` — **accepted** |
+
+   The release archive still carries all four emSign roots (`Root CA - G1`, `ECC Root CA - G3`, `Root CA - C1`, `ECC Root CA - C3`). So a clean, fully patched image running an upgraded forum is still trusting the compromised chain on every outbound request XenForo makes, until this step runs.
+
+8. **Merge the outdated templates** in the ACP. The upgrade reports them and they are not an error, but customised templates stay on the old version until someone merges them, and new features can misbehave until they do. For 2.3.13 it was three.
 
 ## XenForo's own CA bundle, and why step 7 is not optional
 
@@ -190,7 +279,9 @@ Three consequences worth internalising:
 - **Rebuilding the image does not touch it either**, because the forum tree lives on the PersistentVolume. The bundle is only as fresh as the release that unpacked it.
 - **A XenForo upgrade resets it** to that release's snapshot, which is why the refresh is a numbered step above rather than a one-off.
 
-This stopped being theoretical on 2026-10-20. The eMudhra CA compromise (CVE-2026-111943) put eight recoverable intermediate CA keys in circulation, and the shipped bundle still trusted `emSign ECC Root CA - G3`, the root they cross-sign up to. Verified against the live pod: XF's bundle accepted a certificate chaining to a compromised intermediate while the same request through the system store also did. Two stores, two fixes.
+This stopped being theoretical on 2026-10-20. The eMudhra CA compromise (CVE-2026-111943) put eight recoverable intermediate CA keys in circulation, and the shipped bundle still trusted `emSign ECC Root CA - G3`, the root they cross-sign up to. Verified against the live pod on 2026-10-26: XF's bundle accepted a chain built on a compromised intermediate, and so did the system store. Two stores, two fixes.
+
+The two fixes have since landed at different times, which is what makes the split concrete rather than theoretical. Patching the image fixed the system store and left XenForo's untouched; upgrading XenForo reset its bundle back to a vulnerable snapshot without affecting the system store. Step 7 above records both halves measured in the same container, in opposite states, on 2026-11-04.
 
 `scripts/refresh-ca-bundle.sh` installs the current [curl extract](https://curl.se/docs/caextract.html), which is what XenForo's own `ca-bundle-readme.txt` says to do, and regenerates `ca-bundle-legacy-openssl.crt` as bundle + `legacy-equifax.crt` (that variant exists so Google endpoints validate on OpenSSL older than 1.0.2).
 
