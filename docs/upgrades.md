@@ -62,7 +62,8 @@ CI rebuilds `ghcr.io/siliconsaga/xenforo-k8s` on every push to `image/`, and wee
    With Docker, run it on **both** architectures. The pin is the multi-arch index digest, so verifying only `linux/amd64` leaves the arm64 variant — the one a k3d dev cluster or an arm64 node resolves — entirely unchecked, and the two are separate builds that can differ:
 
    ```bash
-   D=ghcr.io/siliconsaga/xenforo-k8s@<digest-from-step-1>
+   DIGEST=sha256:...        # the index digest from step 1
+   D="ghcr.io/siliconsaga/xenforo-k8s@$DIGEST"
    rc=0
    for p in linux/amd64 linux/arm64; do
      echo "== $p =="
@@ -80,7 +81,7 @@ CI rebuilds `ghcr.io/siliconsaga/xenforo-k8s` on every push to `image/`, and wee
    ```bash
    PROBE="xf-image-probe-$$"
    kubectl -n xenforo run "$PROBE" --restart=Never \
-     --image=ghcr.io/siliconsaga/xenforo-k8s@<digest-from-step-1> \
+     --image="ghcr.io/siliconsaga/xenforo-k8s@$DIGEST" \
      --command -- sh -c "$(cat verify-image.sh)" \
      || { echo "FATAL: could not create the probe pod" >&2; exit 1; }
 
@@ -147,18 +148,39 @@ XenForo upgrades are file-replacement plus a schema migration, and both happen a
    Step 1 names the release several times, so set it once. Drop the dots: these become Kubernetes and Velero object names.
 
    ```bash
-   VER=2313     # 2.3.13, the version you are upgrading TO
+   VER=2313                                  # 2.3.13, the version you are upgrading TO
+   RUN="$VER-$(date -u +%Y%m%d-%H%M%S)"      # this attempt, not this release
    ```
+
+   **`RUN`, not `VER`, names anything this step creates — because a retry under a stable name reads the *previous* attempt and calls it green.** This document already teaches that lesson for the probe pod a few sections up (`$$` in the name, `||` on `run`); step 1 spent longer than it should have ignoring it. Measured on a throwaway namespace, with a job named for the release:
+
+   ```text
+   create  → error: failed to create job: jobs.batch "xenforo-db-pre-2313" already exists   (exit 1)
+   wait    → job.batch/xenforo-db-pre-2313 condition met                                    (exit 0)
+   logs    → attempt-one
+   ```
+
+   The `create` fails, and the two commands after it report success about the backup you took *last* time — the `creationTimestamp` never moved. One red line scrolls past, two green ones follow, and you go into a schema migration behind a dump whose age you have just misread. A per-attempt name turns that same retry into `Error from server (NotFound)` on the `wait`, which is the failure you want: loud, and about the right object.
+
+   A timestamp rather than the `$$` the probe pod uses, because these objects are *kept*. A backup's name should say when it was taken; a throwaway probe's only has to be unique.
 
    **Which half applies depends on the overlay, and the two are opposites.** `components/backup` is composed only by `kustomize/overlays/gitops`, so the CronJob below exists there and *only* there; `components/db-throwaway` and its local `xenforo-db` Deployment belong only to `plain`. Check with `kubectl -n xenforo get cronjob` before picking.
 
    On the **gitops** overlay a nightly `xenforo-db-backup` CronJob already exists with 14-day retention, so take a fresh run of it rather than hand-rolling a dump. It carries the `--set-gtid-purged=OFF` and `--no-tablespaces` flags a vended DataService tenant needs, and it verifies its own output — `gzip -t` plus mysqldump's `-- Dump completed` footer — before publishing the file under its real name:
 
    ```bash
-   kubectl -n xenforo create job "xenforo-db-pre-$VER" --from=cronjob/xenforo-db-backup
-   kubectl -n xenforo wait --for=condition=Complete "job/xenforo-db-pre-$VER" --timeout=300s
-   kubectl -n xenforo logs "job/xenforo-db-pre-$VER"
+   kubectl -n xenforo create job "xenforo-db-pre-$RUN" --from=cronjob/xenforo-db-backup \
+     || { echo "FATAL: could not create the backup job" >&2; exit 1; }
+
+   rc=0
+   kubectl -n xenforo wait --for=condition=Complete "job/xenforo-db-pre-$RUN" --timeout=300s || rc=$?
+   kubectl -n xenforo logs "job/xenforo-db-pre-$RUN"
+   [ "$rc" = 0 ] || { echo "FATAL: backup job never completed (wait exit $rc)" >&2; exit 1; }
    ```
+
+   **`rc` for the same reason as the probe pod: `logs` succeeds against a failed job.** A `wait` that times out exits non-zero, then `logs` prints whatever the container managed to say and exits 0 — so the block ends green, on the status of a command that was only ever meant to explain the failure. Print the logs either way, and let the saved status have the last word.
+
+   Expect a *failed* job to spend the whole `--timeout` there rather than failing fast: a job that failed is not `Complete`, and `kubectl wait` has no way to watch for either condition, so it waits out the clock and then reports the timeout. Five minutes of silence is the failure path, not a hang — and the logs printed afterwards say which.
 
    ⚠ **On gitops, do not reach for `kubectl exec deploy/xenforo-db -- mysqldump`** — this document said to for longer than it should have. There is no `xenforo-db` Deployment on that overlay at all; the database is mimir's shared MySQL, reached through the `xenforo-db-dataservice` Secret, so the command fails with `deployments.apps "xenforo-db" not found`, which reads like "backups are impossible here" rather than "wrong flavor".
 
@@ -168,6 +190,14 @@ XenForo upgrades are file-replacement plus a schema migration, and both happen a
    kubectl -n xenforo rollout status deploy/xenforo-db --timeout=120s
    kubectl -n xenforo exec deploy/xenforo-db -- sh -c '
      set -euo pipefail
+
+     # Clear any dump left by an earlier attempt. This name is fixed, since
+     # RUN cannot expand inside a single-quoted body, so a failed retry would
+     # otherwise leave a complete, valid, STALE .sql.gz for the copy below to
+     # collect, and it passes every check: nothing is wrong with it but age.
+     # (No apostrophes in here, either. One would close the sh -c body and
+     # run the rest of this on your workstation.)
+     rm -f /tmp/xenforo-pre.sql.gz
 
      # A defaults file, not --password=: anything in argv is readable from
      # `ps` by every process in the container. The Deployment mounts the
@@ -194,8 +224,10 @@ XenForo upgrades are file-replacement plus a schema migration, and both happen a
      gzip -cd /tmp/xenforo-pre.sql.gz | tail -5 | grep -q "^-- Dump completed"
      rm -f /tmp/my.cnf
      stat -c %s /tmp/xenforo-pre.sql.gz
-   '
+   ' || { echo "FATAL: the dump failed; do not copy anything" >&2; exit 1; }
    ```
+
+   **The `||` matters because `set -euo pipefail` only governs the inside of `sh -c`.** A failed dump exits `kubectl exec` non-zero and then stops mattering: the copy block below is a separate paste, and an interactive shell runs it regardless. The guard is what makes "the dump failed" and "do not copy" the same event.
 
    The heredoc body sits at column 0 on purpose: `<<EOF` takes its terminator there, and the single-quoted `sh -c` body is what defers `$(cat …)`, `$MYSQL_USER` and `$MYSQL_DATABASE` to the container instead of expanding them in your shell.
 
@@ -204,11 +236,18 @@ XenForo upgrades are file-replacement plus a schema migration, and both happen a
    ```bash
    DB=$(kubectl -n xenforo get pod -l app=xenforo-db -o name)
    DB=${DB#pod/}
-   kubectl -n xenforo cp "$DB:/tmp/xenforo-pre.sql.gz" "./xenforo-pre-$VER.sql.gz" --retries=5
-   gzip -t "./xenforo-pre-$VER.sql.gz"
+   kubectl -n xenforo cp "$DB:/tmp/xenforo-pre.sql.gz" "./xenforo-pre-$RUN.sql.gz" --retries=5 \
+     || { echo "FATAL: copy failed; the only dump is still on a pod about to be replaced" >&2; exit 1; }
+
+   gzip -t "./xenforo-pre-$RUN.sql.gz"
+   gzip -cd "./xenforo-pre-$RUN.sql.gz" | tail -5 | grep -q '^-- Dump completed'
    ```
 
    Compare the local byte count against the `stat` the dump printed — the truncation `--retries` exists for is described under step 2.
+
+   **Both checks again on the local copy, and they catch different things — measured, because the obvious guess is wrong.** A mid-stream truncation, which is exactly what a failed `kubectl cp` leaves, does *not* sneak past `gzip -t`: it fails with `unexpected end of file`. What sails through `gzip -t` is a **complete** gzip of an **incomplete** dump — a valid archive, correct CRC, no footer.
+
+   And that is not a hypothetical. Breaking authentication and running the dump block above leaves `/tmp/xenforo-pre.sql.gz` **present, 20 bytes, and valid gzip** — the redirect created the file before `mysqldump` ever spoke to the server. The guard is what stops you reaching for it; the footer check is what catches you if you do. So `gzip -t` is the check for a broken transfer, the footer is the check for a dump that never finished, and neither substitutes for the other. The copy is the artifact you would actually restore from, so it is the one that has to earn both.
 
    **`set -o pipefail` is the line that makes this a backup rather than a file.** `mysqldump` pipes into `gzip`, and a shell reports only the last command's status, so a dump that dies on connect still leaves `gzip` exiting 0. Measured in a throwaway `mysql:8.4`: without `pipefail` that sequence exits **0**, writes a **20-byte** `.sql.gz`, and **`gzip -t` passes on it** — a perfectly valid archive of nothing. Only the `-- Dump completed` footer rejects it, which is why both checks are here and neither is redundant. (`pipefail` is safe to rely on in this container: `/bin/sh` in `mysql:8.4` is bash.)
 
@@ -217,18 +256,32 @@ XenForo upgrades are file-replacement plus a schema migration, and both happen a
    The volume is the other half, and the `.sql.gz` does **not** contain it: `internal_data/` holds the attachments. Velero snapshots it:
 
    ```bash
-   velero backup create "xenforo-pre-$VER" --include-namespaces xenforo \
-     --snapshot-volumes --wait
+   velero backup create "xenforo-pre-$RUN" --include-namespaces xenforo \
+     --snapshot-volumes --wait \
+     || { echo "FATAL: backup did not complete; do not start the upgrade" >&2; exit 1; }
    ```
 
    **`--wait` is not cosmetic.** `backup create` returns as soon as the object is accepted, so the status read below would otherwise race the controller: an `InProgress` backup reports empty snapshot counts, and empty is easy to misread as "no volumes were captured" — or, worse, to skim as a pair of zeroes that look like a clean answer. Wait for a terminal phase, then read:
 
    ```bash
-   kubectl -n velero get backups.velero.io "xenforo-pre-$VER" \
+   kubectl -n velero get backups.velero.io "xenforo-pre-$RUN" \
      -o custom-columns='PHASE:.status.phase,TRIED:.status.volumeSnapshotsAttempted,DONE:.status.volumeSnapshotsCompleted,ERR:.status.errors'
    ```
 
-   Then check the snapshot *count*, not just the phase — a backup that captured metadata and no volumes also reports `Completed`. Two assertions, both required: `PHASE` is exactly `Completed` (**not** `PartiallyFailed`, which is a terminal phase that also carries real data and is easy to accept by reflex), and `DONE` equals `TRIED` and is non-zero. For the 2.3.13 upgrade that read `Completed / 2 / 2 / <none>` (as `xenforo-pre-2313`) — both `xenforo-data` and `xenforo-backups`.
+   Then check the snapshot *count*, not just the phase — a backup that captured metadata and no volumes also reports `Completed`. Two assertions, both required: `PHASE` is exactly `Completed` (**not** `PartiallyFailed`, which is a terminal phase that also carries real data and is easy to accept by reflex), and `DONE` equals `TRIED` and is non-zero. For the 2.3.13 upgrade that read `Completed / 2 / 2 / <none>` (as `xenforo-pre-2313`).
+
+   **Two is the right count on either overlay, and that is the trap — the names are what differ.** Rendering both overlays gives two PVCs each:
+
+   | overlay | volumes Velero should capture |
+   | --- | --- |
+   | `gitops` | `xenforo-data`, `xenforo-backups` |
+   | `plain` | `xenforo-data`, `xenforo-db-data` |
+
+   So `DONE / TRIED` of `2 / 2` reads correct on both while meaning different things, and `xenforo-backups` does not exist on `plain` at all. The count assertion stands as written; just do not use the gitops names as a checklist against a `plain` cluster — read the names back instead:
+
+   ```bash
+   kubectl -n xenforo get pvc -o name
+   ```
 
 2. **Rehearse in the Docker flavor, against the real data.** This is the main reason flavor 1 exists, and it costs a few minutes if you skip what the migration cannot touch.
 
@@ -250,10 +303,11 @@ XenForo upgrades are file-replacement plus a schema migration, and both happen a
    Restore the dump with MySQL's own `source`, which needs no shell pipeline:
 
    ```bash
-   gunzip -k xenforo-<stamp>.sql.gz
-   tail -5 xenforo-<stamp>.sql          # `-- Dump completed` must be present
+   DUMP=xenforo-pre-2313-20261104-160000     # whichever file step 1 produced
+   gunzip -k "$DUMP.sql.gz"
+   tail -5 "$DUMP.sql"                  # `-- Dump completed` must be present
    docker compose -f docker/compose.yaml up -d --wait db
-   docker compose -f docker/compose.yaml cp xenforo-<stamp>.sql db:/tmp/dump.sql
+   docker compose -f docker/compose.yaml cp "$DUMP.sql" db:/tmp/dump.sql
    docker compose -f docker/compose.yaml exec db sh -c \
      'MYSQL_PWD="$MYSQL_PASSWORD" mysql -u "$MYSQL_USER" "$MYSQL_DATABASE" -e "source /tmp/dump.sql"'
    ```
@@ -267,8 +321,10 @@ XenForo upgrades are file-replacement plus a schema migration, and both happen a
    **Rehearse on the pinned image, not a local build.** `docker compose build` takes ~25 minutes; tagging the digest the cluster actually runs takes seconds and is strictly better fidelity:
 
    ```bash
-   docker pull ghcr.io/siliconsaga/xenforo-k8s@<digest-from-kustomization>
-   docker tag  ghcr.io/siliconsaga/xenforo-k8s@<digest-from-kustomization> xenforo-k8s:local
+   DIGEST=$(grep -A1 'name: ghcr.io/siliconsaga/xenforo-k8s' kustomize/base/kustomization.yaml \
+     | sed -n 's/.*digest: *//p')
+   docker pull "ghcr.io/siliconsaga/xenforo-k8s@$DIGEST"
+   docker tag  "ghcr.io/siliconsaga/xenforo-k8s@$DIGEST" xenforo-k8s:local
    docker compose -f docker/compose.yaml up -d --no-build xenforo caddy
    ```
 
