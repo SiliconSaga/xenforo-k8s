@@ -18,39 +18,52 @@ CI rebuilds `ghcr.io/siliconsaga/xenforo-k8s` on every push to `image/`, and wee
 
    Set the digest once and check **that**, never `:latest`. The tag can move between step 1 and step 2, and a stale local tag can answer for a different image entirely — verifying `:latest` and then committing a digest checks something you are not shipping:
 
-   ```bash
-   D=ghcr.io/siliconsaga/xenforo-k8s@sha256:<digest-from-step-1>
+   The check is one script, used two ways. It asserts rather than prints, so its exit status is the whole answer:
 
-   docker run --rm --platform linux/amd64 "$D" php -v
-   docker run --rm --platform linux/amd64 "$D" apk list --installed ca-certificates
-   docker run --rm --platform linux/amd64 "$D" \
-     curl -sS --max-time 20 -o /dev/null https://dv-g3b-emudhra.we-have-a-problem.com/
+   ```sh
+   # verify-image.sh — exits 0 only if this image is safe to pin.
+   set -eu
+   php -v
+   apk list --installed ca-certificates
+
+   # Negative control: this host serves a chain built on one of the recoverable
+   # eMudhra keys, so a trustworthy store MUST refuse it.
+   rc=0
+   verify="$(curl -sS --max-time 20 -o /dev/null -w '%{ssl_verify_result}' \
+     https://dv-g3b-emudhra.we-have-a-problem.com/)" || rc=$?
+   case "$rc" in
+     60) ;;  # CURLE_PEER_FAILED_VERIFICATION — the only acceptable answer
+     0)  echo "FATAL: trust store ACCEPTS the compromised chain" >&2; exit 1 ;;
+     *)  echo "FATAL: no TLS verdict (curl exit $rc) — the probe never reached the host" >&2; exit 1 ;;
+   esac
+   [ "$verify" = 20 ] || { echo "FATAL: rejected, but ssl_verify_result=$verify (expected 20)" >&2; exit 1; }
+   echo "OK: compromised chain rejected (exit 60, verify 20)"
    ```
 
-   **The third command must FAIL, with exit 60.** It is a negative control: that host serves a chain built on one of the recoverable eMudhra keys, so a zero exit means the image's trust store still accepts it and the digest must not be pinned. Exit 60 is `CURLE_PEER_FAILED_VERIFICATION`; any other non-zero exit means the probe never reached a TLS verdict (DNS, egress, timeout) and has told you nothing — see the three-way logic in `scripts/refresh-ca-bundle.sh`.
+   **Read the exit code precisely; "curl failed" is not "the chain was rejected."** DNS failure, blocked egress and timeouts all exit non-zero too, so a plain `if curl ...; then fail; fi` passes a *vulnerable* image whenever the probe simply never got through. Only exit 60 with `ssl_verify_result=20` is a rejection; everything else is no verdict, and no verdict must fail the check. This is the same three-way logic as `scripts/refresh-ca-bundle.sh`, for the same reason — and it has been got wrong here more than once.
 
-   With no working Docker, run the same checks as a throwaway pod on the digest — which also tests exactly what the cluster will pull. The script asserts rather than prints, so the pod's phase *is* the result:
+   With Docker:
+
+   ```bash
+   D=ghcr.io/siliconsaga/xenforo-k8s@sha256:<digest-from-step-1>
+   docker run --rm --platform linux/amd64 "$D" sh -c "$(cat verify-image.sh)"
+   ```
+
+   With no working Docker, run it as a throwaway pod on the digest — which also tests exactly what the cluster will pull:
 
    ```bash
    kubectl -n xenforo run xf-image-probe --restart=Never \
      --image=ghcr.io/siliconsaga/xenforo-k8s@sha256:<digest-from-step-1> \
-     --command -- sh -c '
-       set -eu
-       php -v
-       apk list --installed ca-certificates
-       if curl -sS --max-time 20 -o /dev/null https://dv-g3b-emudhra.we-have-a-problem.com/; then
-         echo "FATAL: trust store ACCEPTS the compromised chain" >&2
-         exit 1
-       fi
-       echo "OK: compromised chain rejected"
-     '
+     --command -- sh -c "$(cat verify-image.sh)"
 
    kubectl -n xenforo wait --for=jsonpath='{.status.phase}'=Succeeded pod/xf-image-probe --timeout=180s
    kubectl -n xenforo logs xf-image-probe
    kubectl -n xenforo delete pod xf-image-probe
    ```
 
-   Two details that are easy to get wrong and both were, here. **Wait for the pod**: `kubectl run --restart=Never` returns while the pod is still `Pending`, so reading logs immediately can fail before the container has started — and a failed `logs` call looks like a broken probe rather than a race. **Do not pipe `php -v`**: `php -v | head -n1` discards PHP's exit status, and chaining with `;` reports only the last command's, so the probe can pass with no working PHP at all. `set -eu` plus unpiped commands is what makes a failure a failure.
+   The `wait` is load-bearing: `kubectl run --restart=Never` returns while the pod is still `Pending`, so reading logs immediately can fail before the container has started — and a failed `logs` call reads as a broken probe rather than a race. A non-`Succeeded` phase *is* the failure signal; the logs only tell you which branch tripped.
+
+   One more trap in the script above: `php -v | head -n1` would discard PHP's exit status, and chaining with `;` reports only the last command's. `set -eu` with unpiped commands is what makes a failure fail.
 
 3. **Bump the digest** in `kustomize/base/kustomization.yaml` and commit it. The commit is the record of what the cluster runs — the thing `latest` could never give you.
 
@@ -65,7 +78,17 @@ CI rebuilds `ghcr.io/siliconsaga/xenforo-k8s` on every push to `image/`, and wee
 
    `apply` changes the pod spec, which triggers the rollout on its own — no `rollout restart` needed. Under ArgoCD, the commit from step 3 replaces the apply, and for the plain flavor it is `kubectl apply -k kustomize/overlays/plain`.
 
-   ⚠ **Check which overlay the cluster is actually running before applying one.** They are not interchangeable: `plain` carries `db-throwaway` and a literal Secret, `gitops` carries `db-dataservice` and an HTTPRoute. Applying `plain` over this deployment would point the forum at a different, empty database. `kubectl -n xenforo get httproute,externalsecret` tells them apart — an HTTPRoute and no ExternalSecret is the gitops flavor.
+   ⚠ **Check which overlay the cluster is actually running before applying one.** They are not interchangeable, and the axis that matters is the database: `plain` carries `db-throwaway`, `gitops` carries `db-dataservice`. Applying `plain` over this deployment would repoint the forum at a different, empty database.
+
+   So check the database credential, not the routing — each flavor names its own:
+
+   ```bash
+   kubectl -n xenforo get secret
+   ```
+
+   `xenforo-db-dataservice` is **gitops**; `xenforo-secrets` is **plain**. To see the binding itself rather than infer it from the Secret's existence, read the Deployment's `php-fpm` env: a literal `XF_DB_HOST: xenforo-db` is base's default (plain), while gitops patches it to a `secretKeyRef` on `xenforo-db-dataservice`.
+
+   Routing is a weaker tell. An HTTPRoute does distinguish them, but *absence of an ExternalSecret* proves nothing — the gitops overlay deliberately dropped `secrets-openbao` once the DataService began owning the password, so neither flavor has one.
 
    Roll back by reverting the commit and applying again, or `kubectl -n xenforo rollout undo deploy/xenforo` for an immediate fix.
 
