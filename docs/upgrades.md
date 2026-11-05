@@ -4,62 +4,618 @@ Two things upgrade independently, and keeping them separate is the point of the 
 
 ## Upgrading the runtime image
 
-Nothing to do — CI rebuilds `ghcr.io/siliconsaga/xenforo-k8s:latest` on every push to `image/`, and weekly for base-image security fixes. Roll it out with:
+CI rebuilds `ghcr.io/siliconsaga/xenforo-k8s` on every push to `image/`, and weekly for base-image security fixes. But `kustomize/base/kustomization.yaml` pins a **digest**, so a rebuild does not reach the cluster until someone bumps it. That is deliberate — see the comment there — and it means the image upgrade is a four-step job, not zero.
+
+1. **Find the new index digest.** Not a per-platform one: the index digest is what lets amd64 GKE nodes and arm64 k3d dev clusters resolve from the same pin.
+
+   ```bash
+   docker buildx imagetools inspect ghcr.io/siliconsaga/xenforo-k8s:latest
+   ```
+
+   The top-level `Digest:` is the one you want, and it **already carries its `sha256:` prefix** — copy the whole value, because every placeholder below expects it. Pasting it after a second prefix gives `@sha256:sha256:…`, which fails as a malformed reference rather than as a missing image, so the error does not point at the typo. This talks to the registry, not the local daemon, so it works even when Docker is unhealthy.
+
+2. **Verify it before pinning it.** A green CI log says the build succeeded, not that the result is what you think. Check the three things that have actually gone wrong here — PHP version, CA package version, and whether the trust store rejects a known-bad chain.
+
+   Set the digest once and check **that**, never `:latest`. The tag can move between step 1 and step 2, and a stale local tag can answer for a different image entirely — verifying `:latest` and then committing a digest checks something you are not shipping:
+
+   The check is one script, used two ways. It asserts rather than prints, so its exit status is the whole answer:
+
+   ```sh
+   # verify-image.sh — exits 0 only if this image is safe to pin.
+   set -eu
+
+   # Floors, not just printouts. Echoing a version proves nothing: an image can
+   # print PHP 8.4.26 and still pass a TLS probe, and 8.4.26 is the
+   # unauthenticated-RCE build (CVE-2026-109618/109619). Bump these together
+   # with ARG CA_CERTIFICATES_MIN in image/Dockerfile.
+   PHP_FLOOR=8.4.27
+   CA_FLOOR=20261020-r0
+
+   php_have="$(php -r 'echo PHP_VERSION;')"
+   echo "php: $php_have (floor $PHP_FLOOR)"
+   php -r "exit(version_compare(PHP_VERSION, '$PHP_FLOOR', '>=') ? 0 : 1);" \
+     || { echo "FATAL: PHP $php_have is below the $PHP_FLOOR floor" >&2; exit 1; }
+
+   # apk's own comparator, same as the Dockerfile's floor check — busybox sort
+   # has no reliable -V, and these versions are not plain semver.
+   ca_have="$(apk list --installed ca-certificates | head -n1 | cut -d' ' -f1 | sed 's/^ca-certificates-//')"
+   echo "ca-certificates: $ca_have (floor $CA_FLOOR)"
+   [ "$(apk version -t "$ca_have" "$CA_FLOOR")" != "<" ] \
+     || { echo "FATAL: ca-certificates $ca_have is below the $CA_FLOOR floor" >&2; exit 1; }
+
+   # Negative control: this host serves a chain built on one of the recoverable
+   # eMudhra keys, so a trustworthy store MUST refuse it.
+   rc=0
+   verify="$(curl -sS --max-time 20 -o /dev/null -w '%{ssl_verify_result}' \
+     https://dv-g3b-emudhra.we-have-a-problem.com/)" || rc=$?
+   case "$rc" in
+     60) ;;  # CURLE_PEER_FAILED_VERIFICATION — the only acceptable answer
+     0)  echo "FATAL: trust store ACCEPTS the compromised chain" >&2; exit 1 ;;
+     *)  echo "FATAL: no TLS verdict (curl exit $rc) — the probe never reached the host" >&2; exit 1 ;;
+   esac
+   [ "$verify" = 20 ] || { echo "FATAL: rejected, but ssl_verify_result=$verify (expected 20)" >&2; exit 1; }
+   echo "OK: compromised chain rejected (exit 60, verify 20)"
+
+   # Positive control, and the reason it is not optional: a store that trusts
+   # NOTHING rejects the host above too, so the negative control alone passes an
+   # image whose CA bundle cannot validate anything at all. Read the exit code
+   # here as well rather than using `curl -f` — -f fails on any HTTP status, and
+   # a 403 from a bot-blocking edge says nothing about the handshake.
+   rc=0
+   curl -sS --max-time 20 -o /dev/null https://accounts.google.com/ || rc=$?
+   case "$rc" in
+     0)  ;;  # the handshake completed, which is the whole claim
+     60) echo "FATAL: trust store REJECTS legitimate TLS" >&2; exit 1 ;;
+     *)  echo "FATAL: no verdict on the positive control (curl exit $rc)" >&2; exit 1 ;;
+   esac
+   echo "OK: legitimate chain still validates"
+   ```
+
+   **Read the exit code precisely; "curl failed" is not "the chain was rejected."** DNS failure, blocked egress and timeouts all exit non-zero too, so a plain `if curl ...; then fail; fi` passes a *vulnerable* image whenever the probe simply never got through. Only exit 60 with `ssl_verify_result=20` is a rejection; everything else is no verdict, and no verdict must fail the check. This is the same three-way logic as `scripts/refresh-ca-bundle.sh`, for the same reason — and it has been got wrong here more than once.
+
+   **Both controls, for the same reason that script runs both.** `check_bundle` proves the compromised chain is refused; `expect_accept` proves a legitimate one still validates, because — in that file's own words — "a bundle which rejects everything would sail through the negative controls." A store with no roots at all answers exit 60 / verify 20 to *every* host, which is indistinguishable from a correct refusal if refusal is all you ask about.
+
+   With Docker, run it on **both** architectures. The pin is the multi-arch index digest, so verifying only `linux/amd64` leaves the arm64 variant — the one a k3d dev cluster or an arm64 node resolves — entirely unchecked, and the two are separate builds that can differ:
+
+   ```bash
+   DIGEST=sha256:...        # the index digest from step 1
+   D="ghcr.io/siliconsaga/xenforo-k8s@$DIGEST"
+
+   # Read the script ONCE, and refuse to run on nothing: `sh -c ""` exits 0, so
+   # a verify-image.sh that is missing, unreadable or empty reports every
+   # architecture as verified. Measured — `docker run ... sh -c "$(cat
+   # no-such-file)"` exits 0.
+   VERIFY=$(cat verify-image.sh) \
+     || { echo "FATAL: cannot read verify-image.sh" >&2; exit 1; }
+   [ -n "$VERIFY" ] || { echo "FATAL: verify-image.sh is empty; nothing would be checked" >&2; exit 1; }
+
+   rc=0
+   for p in linux/amd64 linux/arm64; do
+     echo "== $p =="
+     docker run --rm --platform "$p" "$D" sh -c "$VERIFY" || rc=1
+   done
+   [ "$rc" = 0 ] || { echo "FATAL: an architecture failed verification" >&2; exit 1; }
+   ```
+
+   **The `VERIFY` guard is the same shape as everything else on this page: a check that cannot fail is worse than no check.** `cat` on a missing file writes to stderr and yields an empty string, the command substitution swallows its status, and `sh -c ""` is a successful program that examined nothing. The image is then pinned on the strength of a script you never saved.
+
+   The non-native one runs under QEMU and is slower, but it is the same assertion.
+
+   **`rc` is load-bearing, because a `for` loop exits with the status of its *last* iteration.** Without it an amd64 variant that fails every floor still leaves the block at exit 0, so long as arm64 passes — the same "the command failed but the block succeeded" shape as the `curl -f` trap above, and which arch it hides depends only on listing order. Collecting into `rc` rather than relying on `set -e` is deliberate: `set -e` aborts on the first bad arch, and whether *both* variants are broken or only one is the difference between a bad build and a bad publish.
+
+   With no working Docker, run it as a throwaway pod on the digest — which also tests exactly what the cluster will pull. **Probe once per architecture the cluster can schedule on, and pin each probe to one.** An unpinned pod lands wherever the scheduler puts it, so on a mixed-arch cluster it can verify one variant while `deploy/xenforo` later pulls the other — a green check on an image the forum never runs. Read the list off the nodes rather than naming it, because the base Deployment sets no `nodeSelector` and no affinity, so every node is eligible:
+
+   ```bash
+   DIGEST=sha256:...        # the index digest from step 1; this block stands alone
+
+   VERIFY=$(cat verify-image.sh) \
+     || { echo "FATAL: cannot read verify-image.sh" >&2; exit 1; }
+   [ -n "$VERIFY" ] || { echo "FATAL: verify-image.sh is empty; nothing would be checked" >&2; exit 1; }
+
+   # Ask the cluster only if you have not answered already, so that the manual
+   # fallback below is not overwritten the moment you re-paste this block.
+   #
+   # And not as one pipeline: `kubectl ... | sort -u` reports SORT's status, and
+   # sort succeeds on no input, so a Forbidden or unreachable node query would
+   # leave ARCHES empty, run zero probes, and exit 0. Measured, with a kubectl
+   # that exits 1: probes run 0, verdict verified.
+   if [ -z "${ARCHES:-}" ]; then
+     ARCHES=$(kubectl get nodes \
+       -o jsonpath='{range .items[*]}{.metadata.labels.kubernetes\.io/arch}{"\n"}{end}') \
+       || { echo "FATAL: could not list nodes; set ARCHES by hand (below)" >&2; exit 1; }
+   fi
+   # Normalise to one arch per line before testing it, because `[ -n ]` on a
+   # whitespace-only value is TRUE while `for ARCH in $ARCHES` iterates zero
+   # times — the same fail-open with a different disguise.
+   ARCHES=$(printf '%s\n' "$ARCHES" | tr -s '[:space:]' '\n' | sed '/^$/d' | sort -u)
+   [ -n "$ARCHES" ] || { echo "FATAL: no node architectures; refusing to verify nothing" >&2; exit 1; }
+   echo "probing: $ARCHES"
+
+   rc=0
+   for ARCH in $ARCHES; do
+     PROBE="xf-image-probe-$ARCH-$$"
+     kubectl -n xenforo run "$PROBE" --restart=Never \
+       --image="ghcr.io/siliconsaga/xenforo-k8s@$DIGEST" \
+       --overrides="{\"spec\":{\"nodeSelector\":{\"kubernetes.io/arch\":\"$ARCH\"}}}" \
+       --command -- sh -c "$VERIFY" \
+       || { echo "FATAL: could not create the $ARCH probe pod" >&2; exit 1; }
+
+     wait_rc=0
+     kubectl -n xenforo wait --for=jsonpath='{.status.phase}'=Succeeded "pod/$PROBE" --timeout=180s || wait_rc=$?
+     kubectl -n xenforo logs "$PROBE"
+     kubectl -n xenforo delete pod "$PROBE"
+     [ "$wait_rc" = 0 ] || rc=1
+   done
+   [ "$rc" = 0 ] || { echo "FATAL: an architecture probe failed" >&2; exit 1; }
+   ```
+
+   **`nodes` is a cluster-scoped read, so expect `Forbidden` rather than an answer** if you hold the namespace-scoped access [`README.md`](../README.md) hands out — which is the common case for anyone who is not the cluster admin. That is a normal reply, not a broken cluster, and the guard above turns it into a stop rather than a pass. Name the architectures yourself, **then** paste the block above again — the `if [ -z "${ARCHES:-}" ]` is what keeps your answer from being overwritten by the same failing query:
+
+   ```bash
+   ARCHES=amd64        # or 'amd64 arm64' — what you know the cluster runs
+   ```
+
+   On this cluster the loop runs exactly once — all six nodes are `amd64` as of 2026-11-04 — so the single-arch case is the normal one and the loop costs nothing. It is written this way so that adding an arm64 node pool does not silently halve the check.
+
+   **The `--overrides` merge is additive, which is the only reason this is one flag rather than a hand-written Pod.** Measured on docker-desktop: the override lands `spec.nodeSelector` and leaves the `--image` and `--command` that `kubectl run` generated untouched. An architecture no node offers also fails closed rather than passing — the pod stays `Pending`, and `wait` exits non-zero when the timeout runs out — which is the other reason to read `ARCHES` off the cluster instead of typing it in.
+
+   The `wait` is load-bearing: `kubectl run --restart=Never` returns while the pod is still `Pending`, so reading logs immediately can fail before the container has started — and a failed `logs` call reads as a broken probe rather than a race. A non-`Succeeded` phase *is* the failure signal; the logs only tell you which branch tripped.
+
+   **Save that status before reading the logs, and re-assert it afterwards.** The `logs` and `delete` that follow both succeed against a *failed* pod, so the block without a saved status ends on `delete`'s exit 0 and reports a vulnerable image as verified. There are two variables because there are two questions: `wait_rc` is this architecture's verdict, and `rc` is what survives the loop — a `for` loop otherwise exits with its *last* iteration's status, the same trap the Docker loop above collects `rc` to avoid. Print the logs and clean up either way — you want the diagnosis, and you do not want a leftover pod — but let the saved status have the last word.
+
+   **The `$$` in the pod name, and the `||` on `run`, are both there to stop a *previous* probe from answering for this one.** With a fixed name, an interrupted run leaves `xf-image-probe` behind; the next `kubectl run` then fails with `AlreadyExists`, and `wait` goes on to find that leftover pod already `Succeeded` — on whatever digest it was built for. You get an instant green verdict about an image you never tested. A per-shell name means a leftover cannot be mistaken for the current run, and failing on `run` means a collision stops the block instead of handing it a stale answer. `$ARCH` is in the name for the smaller version of the same problem: two architectures in one loop must not collide with each other.
+
+   One more trap in the script above: `php -v | head -n1` would discard PHP's exit status, and chaining with `;` reports only the last command's. `set -eu` with unpiped commands is what makes a failure fail.
+
+3. **Bump the digest** in `kustomize/base/kustomization.yaml` and commit it. The commit is the record of what the cluster runs — the thing `latest` could never give you.
+
+4. **Apply, then roll out.** `rollout restart` alone is *not enough*: it recreates the pod from the Deployment the cluster already has, so with `:latest` it pulled whatever was newest, and with a digest it would faithfully redeploy the **old** digest. The changed manifest has to reach the cluster first.
+
+   **Which path delivers the digest depends on whether an ArgoCD Application owns xenforo — and today none does.** Checked on GKE 2026-11-03: `kubectl -n argo get applications` lists mimir, nordri, keycloak, velero and the rest, with no `xenforo` among them. So this deployment runs the **gitops** overlay applied directly with `kubectl`, and the manual apply below is the real path rather than a shortcut. Adopting xenforo into ArgoCD is still an open item.
+
+   ```bash
+   kubectl apply -k kustomize/overlays/gitops
+   kubectl -n xenforo rollout status deploy/xenforo
+   ```
+
+   `apply` changes the pod spec, which triggers the rollout on its own — no `rollout restart` needed. For the plain flavor it is `kubectl apply -k kustomize/overlays/plain`.
+
+   ⚠ **Re-check the Application list before each upgrade, because this step becomes actively misleading the moment xenforo is adopted.** [`install.md`](install.md) describes the ArgoCD path for Flavor 3, and there a direct apply is not merely redundant — it is silently undone. ArgoCD syncs from the in-cluster seed-Gitea, not from GitHub, and against a `selfHeal: true` Application a `kubectl apply` is reverted within ~3 minutes. `rollout status` would report the new digest live and the Deployment would quietly return to the old one: a green check and no change, which is worse than an honest failure. Once an `xenforo` Application exists, step 3's commit replaces step 4 entirely — re-hydrate with nordri's `update-embedded-git.sh <homelab|gke>`, hard-refresh the Application, and read the digest off the live Deployment rather than off your own apply.
+
+   ⚠ **Check which overlay the cluster is actually running before applying one.** They are not interchangeable, and the axis that matters is the database: `plain` carries `db-throwaway`, `gitops` carries `db-dataservice`. Applying `plain` over this deployment would repoint the forum at a different, empty database.
+
+   So check the database credential, not the routing — each flavor names its own:
+
+   ```bash
+   kubectl -n xenforo get secret
+   ```
+
+   `xenforo-db-dataservice` is **gitops**; `xenforo-secrets` is **plain**. To see the binding itself rather than infer it from the Secret's existence, read the Deployment's `php-fpm` env: a literal `XF_DB_HOST: xenforo-db` is base's default (plain), while gitops patches it to a `secretKeyRef` on `xenforo-db-dataservice`.
+
+   Routing is a weaker tell. An HTTPRoute does distinguish them, but *absence of an ExternalSecret* proves nothing — the gitops overlay deliberately dropped `secrets-openbao` once the DataService began owning the password, so neither flavor has one.
+
+   **Roll back by writing a known-good digest into step 3's line and applying it** through whichever path step 4 established. Name the digest explicitly; do not reach for a command that means "whatever was here before".
+
+   **Neither `rollout undo` nor `git revert` is that command, and for the same reason.** `rollout undo` restores the *previous revision's pod spec*; `git revert` on step 3's commit restores the *previous manifest*. Until a second pinned commit exists, both of those are `ghcr.io/siliconsaga/xenforo-k8s:latest` with the default `imagePullPolicy: Always` — so neither restores the old image at all. Each pulls whatever `:latest` resolves to at that moment, which is the newest build, quite possibly the one you are rolling back from. They roll *forward* under a reassuring name, and `rollout status` goes green either way. That is the same unreviewable-image problem this whole change exists to end, hiding in the rollback advice — and reverting the pin looks even safer than undoing it, which is what makes it worse.
+
+   Both become trustworthy once two digest-pinned revisions exist, because the thing they restore then names an immutable image. Check before relying on either:
+
+   ```bash
+   kubectl -n xenforo rollout history deploy/xenforo
+   git log --oneline -- kustomize/base/kustomization.yaml
+   ```
+
+   Until then, the digest you are rolling back *to* has to come from somewhere you can read it: that `git log`, the verification note in `kustomize/base/kustomization.yaml`, or `docker buildx imagetools inspect` against a tag you trust.
+
+Afterwards, confirm the volume's CA bundle survived the pod swap — it lives on the PVC and should, but that is the assumption worth testing rather than asserting:
 
 ```bash
-kubectl -n xenforo rollout restart deploy/xenforo
-```
-
-For anything but a homelab, pin a digest in `kustomize/base/kustomization.yaml`'s `images:` block rather than tracking `latest`, so a rollout is a deliberate act with something to roll back to:
-
-```yaml
-images:
-  - name: ghcr.io/siliconsaga/xenforo-k8s
-    newName: ghcr.io/siliconsaga/xenforo-k8s
-    digest: sha256:...
+scripts/refresh-ca-bundle.sh --check
 ```
 
 ## Upgrading XenForo itself
 
 XenForo upgrades are file-replacement plus a schema migration, and both happen against the volume.
 
-1. **Back up first.** The database and the volume, together — a half-migrated forum needs both to roll back.
+1. **Back up first, and verify both halves.** A half-migrated forum needs the database *and* the volume to roll back.
+
+   Step 1 names the release several times, so set it once. Drop the dots: these become Kubernetes and Velero object names.
 
    ```bash
-   kubectl -n xenforo exec deploy/xenforo-db -- \
-     mysqldump -u xenforo -p"$(...)" xenforo > xenforo-$(date +%F).sql
+   VER=2313                                  # 2.3.13, the version you are upgrading TO
+   RUN="$VER-$(date -u +%Y%m%d-%H%M%S)"      # this attempt, not this release
    ```
 
-2. **Rehearse in the Docker flavor.** Point `docker/xf` at a copy of the tree, restore the dump into the compose database, run the upgrade there first. This is the main reason flavor 1 exists.
+   **`RUN`, not `VER`, names anything this step creates — because a retry under a stable name reads the *previous* attempt and calls it green.** This document already teaches that lesson for the probe pod a few sections up (`$$` in the name, `||` on `run`); step 1 spent longer than it should have ignoring it. Measured on a throwaway namespace, with a job named for the release:
 
-3. **Put the forum in maintenance mode** from the admin control panel, or accept errors during the migration.
+   ```text
+   create  → error: failed to create job: jobs.batch "xenforo-db-pre-2313" already exists   (exit 1)
+   wait    → job.batch/xenforo-db-pre-2313 condition met                                    (exit 0)
+   logs    → attempt-one
+   ```
 
-4. **Copy the new files in**, over the top of the existing tree:
+   The `create` fails, and the two commands after it report success about the backup you took *last* time — the `creationTimestamp` never moved. One red line scrolls past, two green ones follow, and you go into a schema migration behind a dump whose age you have just misread. A per-attempt name turns that same retry into `Error from server (NotFound)` on the `wait`, which is the failure you want: loud, and about the right object.
+
+   A timestamp rather than the `$$` the probe pod uses, because these objects are *kept*. A backup's name should say when it was taken; a throwaway probe's only has to be unique.
+
+   **Which half applies depends on the overlay, and the two are opposites.** `components/backup` is composed only by `kustomize/overlays/gitops`, so the CronJob below exists there and *only* there; `components/db-throwaway` and its local `xenforo-db` Deployment belong only to `plain`. Check with `kubectl -n xenforo get cronjob` before picking.
+
+   On the **gitops** overlay a nightly `xenforo-db-backup` CronJob already exists with 14-day retention, so take a fresh run of it rather than hand-rolling a dump. It carries the `--set-gtid-purged=OFF` and `--no-tablespaces` flags a vended DataService tenant needs, and it verifies its own output — `gzip -t` plus mysqldump's `-- Dump completed` footer — before publishing the file under its real name:
+
+   ```bash
+   kubectl -n xenforo create job "xenforo-db-pre-$RUN" --from=cronjob/xenforo-db-backup \
+     || { echo "FATAL: could not create the backup job" >&2; exit 1; }
+
+   rc=0
+   kubectl -n xenforo wait --for=condition=Complete "job/xenforo-db-pre-$RUN" --timeout=300s || rc=$?
+   kubectl -n xenforo logs "job/xenforo-db-pre-$RUN"
+   [ "$rc" = 0 ] || { echo "FATAL: backup job never completed (wait exit $rc)" >&2; exit 1; }
+   ```
+
+   **`rc` for the same reason as the probe pod: `logs` succeeds against a failed job.** A `wait` that times out exits non-zero, then `logs` prints whatever the container managed to say and exits 0 — so the block ends green, on the status of a command that was only ever meant to explain the failure. Print the logs either way, and let the saved status have the last word.
+
+   Expect a *failed* job to spend the whole `--timeout` there rather than failing fast: a job that failed is not `Complete`, and `kubectl wait` has no way to watch for either condition, so it waits out the clock and then reports the timeout. Five minutes of silence is the failure path, not a hang — and the logs printed afterwards say which.
+
+   **That job writes to a PVC, not to your workstation — so fetch the file, or step 2 has nothing to rehearse against.** The CronJob publishes `/backups/xenforo-<TS>.sql.gz` on the `xenforo-backups` volume under a timestamp it picks itself: there is no local file, and the name is not `$RUN`. Read the name out of the job's own log rather than reconstructing it, then mount the PVC in a throwaway pod to copy it off:
+
+   ```bash
+   BK=$(kubectl -n xenforo logs "job/xenforo-db-pre-$RUN" \
+     | sed -n 's|^wrote /backups/\([^ ]*\).*|\1|p')
+   [ -n "$BK" ] || { echo "FATAL: the job printed no filename; read its log" >&2; exit 1; }
+   echo "on the PVC: $BK"
+
+   FETCH="xf-backup-fetch-$$"
+   kubectl -n xenforo apply -f - <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: $FETCH
+spec:
+  restartPolicy: Never
+  containers:
+    - name: fetch
+      image: busybox:1.37
+      command: ["sleep", "600"]
+      volumeMounts:
+        - name: backups
+          mountPath: /backups
+          readOnly: true
+  volumes:
+    - name: backups
+      persistentVolumeClaim:
+        claimName: xenforo-backups
+EOF
+
+   rc=0
+   kubectl -n xenforo wait --for=condition=Ready "pod/$FETCH" --timeout=120s || rc=$?
+   if [ "$rc" = 0 ]; then
+     kubectl -n xenforo cp "$FETCH:/backups/$BK" "./xenforo-pre-$RUN.sql.gz" --retries=5 || rc=$?
+   fi
+   kubectl -n xenforo delete "pod/$FETCH" --wait=false
+   [ "$rc" = 0 ] || { echo "FATAL: the backup is still only on the PVC (exit $rc)" >&2; exit 1; }
+
+   gzip -t "./xenforo-pre-$RUN.sql.gz" \
+     || { echo "FATAL: the local copy is not valid gzip" >&2; exit 1; }
+   gzip -cd "./xenforo-pre-$RUN.sql.gz" | tail -5 | grep -q '^-- Dump completed' \
+     || { echo "FATAL: no completion footer; this is not a backup" >&2; exit 1; }
+   ```
+
+   The local copy takes the `$RUN` name so that step 2 and the Velero backup below agree on one, while the PVC keeps the CronJob's. Note both: the local file is what you rehearse against, and the PVC copy is the one 14-day retention eventually deletes. (The manifest sits at column 0 against the indentation around it because `<<EOF` takes its terminator there regardless — the same reason the `plain` dump below does it.)
+
+   **The `delete` runs whether the copy worked or not, and the status is re-asserted after it** — the probe pod's shape, for the probe pod's reason: `delete` exits 0 against a pod whose `cp` just failed. One piece of expected noise, so it does not read as a failure: `kubectl cp` prints `tar: removing leading '/' from member names` on success. Rehearsed end to end on docker-desktop against a seeded PVC — filename out of the log, pod up, file down, `gzip -t` and the footer both passing on the local copy.
+
+   A backup that exists only inside the cluster is also the weaker artifact, which is the other reason this is not optional: `plain` has copied its dump off since the step above, and the two overlays should not differ on whether the rollback material survives the namespace.
+
+   ⚠ **On gitops, do not reach for `kubectl exec deploy/xenforo-db -- mysqldump`** — this document said to for longer than it should have. There is no `xenforo-db` Deployment on that overlay at all; the database is mimir's shared MySQL, reached through the `xenforo-db-dataservice` Secret, so the command fails with `deployments.apps "xenforo-db" not found`, which reads like "backups are impossible here" rather than "wrong flavor".
+
+   ⚠ **And on `plain`, the CronJob above is the one that does not exist** — `create job --from=cronjob/xenforo-db-backup` fails `not found` there. **Each overlay's correct procedure is the other's error**, which is how a single unqualified instruction ends up wrong for half its readers. That flavor has a local `xenforo-db`, so dump it in place, with the same flags and the same two self-checks the CronJob applies to itself:
+
+   ```bash
+   kubectl -n xenforo rollout status deploy/xenforo-db --timeout=120s
+   kubectl -n xenforo exec deploy/xenforo-db -- sh -c '
+     set -euo pipefail
+
+     # Clear any dump left by an earlier attempt. This name is fixed, since
+     # RUN cannot expand inside a single-quoted body, so a failed retry would
+     # otherwise leave a complete, valid, STALE .sql.gz for the copy below to
+     # collect, and it passes every check: nothing is wrong with it but age.
+     # (No apostrophes in here, either. One would close the sh -c body and
+     # run the rest of this on your workstation.)
+     rm -f /tmp/xenforo-pre.sql.gz
+
+     # A defaults file, not --password=: anything in argv is readable from
+     # `ps` by every process in the container. The Deployment mounts the
+     # password from the `xenforo-secrets` Secret, so read it from there —
+     # this container has no MYSQL_PASSWORD env var to borrow, only
+     # MYSQL_PASSWORD_FILE.
+     umask 077
+     cat > /tmp/my.cnf <<EOF
+   [client]
+   password=$(cat /run/secrets/xenforo/db-password)
+   EOF
+
+     mysqldump \
+       --defaults-extra-file=/tmp/my.cnf \
+       --user="$MYSQL_USER" \
+       --single-transaction \
+       --set-gtid-purged=OFF \
+       --no-tablespaces \
+       --quick \
+       --default-character-set=utf8mb4 \
+       "$MYSQL_DATABASE" | gzip -c > /tmp/xenforo-pre.sql.gz
+
+     gzip -t /tmp/xenforo-pre.sql.gz
+     gzip -cd /tmp/xenforo-pre.sql.gz | tail -5 | grep -q "^-- Dump completed"
+     rm -f /tmp/my.cnf
+     stat -c %s /tmp/xenforo-pre.sql.gz
+   ' || { echo "FATAL: the dump failed; do not copy anything" >&2; exit 1; }
+   ```
+
+   **The `||` matters because `set -euo pipefail` only governs the inside of `sh -c`.** A failed dump exits `kubectl exec` non-zero and then stops mattering: the copy block below is a separate paste, and an interactive shell runs it regardless. The guard is what makes "the dump failed" and "do not copy" the same event.
+
+   The heredoc body sits at column 0 on purpose: `<<EOF` takes its terminator there, and the single-quoted `sh -c` body is what defers `$(cat …)`, `$MYSQL_USER` and `$MYSQL_DATABASE` to the container instead of expanding them in your shell.
+
+   Then get the file off the pod, because `/tmp` dies with the container — and this Deployment is `Recreate`, so the next `kubectl apply` kills it:
+
+   ```bash
+   DB=$(kubectl -n xenforo get pod -l app=xenforo-db -o name)
+   DB=${DB#pod/}
+   kubectl -n xenforo cp "$DB:/tmp/xenforo-pre.sql.gz" "./xenforo-pre-$RUN.sql.gz" --retries=5 \
+     || { echo "FATAL: copy failed; the only dump is still on a pod about to be replaced" >&2; exit 1; }
+
+   gzip -t "./xenforo-pre-$RUN.sql.gz" \
+     || { echo "FATAL: the local copy is not valid gzip" >&2; exit 1; }
+   gzip -cd "./xenforo-pre-$RUN.sql.gz" | tail -5 | grep -q '^-- Dump completed' \
+     || { echo "FATAL: no completion footer; this is not a backup" >&2; exit 1; }
+   ```
+
+   Compare the local byte count against the `stat` the dump printed — the truncation `--retries` exists for is described under step 2.
+
+   **Both checks are guarded one by one rather than with a `set -euo pipefail` at the top of the paste, deliberately.** `exit 1` in a guard fires when *that named check* failed, and says which; `set -e` fires on the next nonzero anything — a `grep` that legitimately matches nothing, a `kubectl get` on an object that is not there — and it outlives the paste in the interactive shell you ran it in, long after this block has scrolled away. The first guard is also what closes the hole in the second: `grep` at the end of a pipeline supplies the pipeline's status, so a truncated archive whose footer happened to survive decompression would pass the footer check alone. It never reaches it, because `gzip -t` on the same file stops the paste first.
+
+   **Both checks again on the local copy, and they catch different things — measured, because the obvious guess is wrong.** A mid-stream truncation, which is exactly what a failed `kubectl cp` leaves, does *not* sneak past `gzip -t`: it fails with `unexpected end of file`. What sails through `gzip -t` is a **complete** gzip of an **incomplete** dump — a valid archive, correct CRC, no footer.
+
+   And that is not a hypothetical. Breaking authentication and running the dump block above leaves `/tmp/xenforo-pre.sql.gz` **present, 20 bytes, and valid gzip** — the redirect created the file before `mysqldump` ever spoke to the server. The guard is what stops you reaching for it; the footer check is what catches you if you do. So `gzip -t` is the check for a broken transfer, the footer is the check for a dump that never finished, and neither substitutes for the other. The copy is the artifact you would actually restore from, so it is the one that has to earn both.
+
+   **`set -o pipefail` is the line that makes this a backup rather than a file.** `mysqldump` pipes into `gzip`, and a shell reports only the last command's status, so a dump that dies on connect still leaves `gzip` exiting 0. Measured in a throwaway `mysql:8.4`: without `pipefail` that sequence exits **0**, writes a **20-byte** `.sql.gz`, and **`gzip -t` passes on it** — a perfectly valid archive of nothing. Only the `-- Dump completed` footer rejects it, which is why both checks are here and neither is redundant. (`pipefail` is safe to rely on in this container: `/bin/sh` in `mysql:8.4` is bash.)
+
+   ⚠ **The two dumps are not interchangeable as *rollback* artifacts**, though the commands produce the same shape of file. `plain` dumps the throwaway database that overlay owns; gitops dumps mimir's shared MySQL through the vended tenant. Restoring one into the other populates the wrong database — the same hazard step 4's overlay warning describes from the other end.
+
+   The volume is the other half, and the `.sql.gz` does **not** contain it: `internal_data/` holds the attachments. Velero snapshots it:
+
+   ```bash
+   velero backup create "xenforo-pre-$RUN" --include-namespaces xenforo \
+     --snapshot-volumes --wait \
+     || { echo "FATAL: backup did not complete; do not start the upgrade" >&2; exit 1; }
+   ```
+
+   **`--wait` is not cosmetic.** `backup create` returns as soon as the object is accepted, so the status read below would otherwise race the controller: an `InProgress` backup reports empty snapshot counts, and empty is easy to misread as "no volumes were captured" — or, worse, to skim as a pair of zeroes that look like a clean answer. Wait for a terminal phase, then read:
+
+   ```bash
+   kubectl -n velero get backups.velero.io "xenforo-pre-$RUN" \
+     -o custom-columns='PHASE:.status.phase,TRIED:.status.volumeSnapshotsAttempted,DONE:.status.volumeSnapshotsCompleted,ERR:.status.errors'
+   ```
+
+   Then check the snapshot *count*, not just the phase — a backup that captured metadata and no volumes also reports `Completed`. Two assertions, both required: `PHASE` is exactly `Completed` (**not** `PartiallyFailed`, which is a terminal phase that also carries real data and is easy to accept by reflex), and `DONE` equals `TRIED` and is non-zero. For the 2.3.13 upgrade that read `Completed / 2 / 2 / <none>` (as `xenforo-pre-2313`).
+
+   **Two is the right count on either overlay, and that is the trap — the names are what differ.** Rendering both overlays gives two PVCs each:
+
+   | overlay | volumes Velero should capture |
+   | --- | --- |
+   | `gitops` | `xenforo-data`, `xenforo-backups` |
+   | `plain` | `xenforo-data`, `xenforo-db-data` |
+
+   So `DONE / TRIED` of `2 / 2` reads correct on both while meaning different things, and `xenforo-backups` does not exist on `plain` at all. The count assertion stands as written; just do not use the gitops names as a checklist against a `plain` cluster — read the names back instead:
+
+   ```bash
+   kubectl -n xenforo get pvc -o name
+   ```
+
+2. **Rehearse in the Docker flavor, against the real data.** This is the main reason flavor 1 exists, and it costs a few minutes if you skip what the migration cannot touch.
+
+   **Skip `internal_data/`.** It was 855MB of a 1.0GB tree and holds attachments and caches the schema migration never reads. Tar the remainder in the pod and copy one file out, rather than `kubectl cp`-ing a directory:
 
    ```bash
    POD=$(kubectl -n xenforo get pod -l app=xenforo -o name)
-   kubectl -n xenforo cp ./xenforo-2.3.y/. "${POD#pod/}":/var/www/html -c php-fpm
+   POD=${POD#pod/}
+   rm -f ./xf-code.tgz
+   kubectl -n xenforo exec "$POD" -c php-fpm -- \
+     tar -czf /tmp/xf-code.tgz -C /var/www/html --exclude=./internal_data --exclude=./data . \
+     && kubectl -n xenforo exec "$POD" -c php-fpm -- ls -l /tmp/xf-code.tgz \
+     && kubectl -n xenforo cp "$POD:/tmp/xf-code.tgz" ./xf-code.tgz -c php-fpm --retries=5 \
+     && ls -l ./xf-code.tgz \
+     && gzip -t ./xf-code.tgz \
+     || { echo "FATAL: no verified copy of the live tree; do not extract" >&2; exit 1; }
    ```
 
-   XenForo release archives are meant to be unpacked over an existing install. Do not delete the tree first — `internal_data/` and `data/` hold your attachments.
+   Compare the two sizes it just printed, then extract:
+
+   ```bash
+   # tar -C will not create this, and docker/xf is gitignored — on a workstation
+   # that has only ever run the Kubernetes flavor it does not exist yet.
+   mkdir -p docker/xf
+   tar -xzf ./xf-code.tgz -C docker/xf \
+     || { echo "FATAL: extract failed; docker/xf is a mixture now, delete it" >&2; exit 1; }
+   mkdir -p docker/xf/data docker/xf/internal_data
+   ```
+
+   **`--retries` is load-bearing and the byte count is how you check it.** A first attempt without it died with `error: unexpected EOF`, and the dump copy in step 1 visibly resumed mid-file (`Resuming copy at 21573632 bytes, retry 1/5`). That is why both `ls -l` calls are in the chain: the in-pod size and the local size, printed next to each other, are the only check that the resume actually finished.
+
+   **The `rm -f` and the `&&`s are there because the stale case is silent.** Ungated, a failed pod `tar` or a failed `cp` leaves everything after it running against whatever `./xf-code.tgz` already existed — an archive from an earlier rehearsal, which is valid gzip, extracts cleanly, and is *old*. The release overlay in step 4 then replaces only the files the release ships and leaves the add-ons under `src/addons/` as that old archive had them, so the rehearsal runs the migration against an add-on set the live forum does not have. Nothing about it looks wrong; it simply is not what you meant to test.
+
+   Restore the dump with MySQL's own `source`, which needs no shell pipeline:
+
+   ```bash
+   # Derived from $RUN, never typed: a literal name is how you end up rehearsing
+   # against an older dump, which decompresses, carries its footer, validates
+   # perfectly, and is the wrong database.
+   : "${RUN:?set RUN to the value step 1 used, e.g. 2313-20261104-160000}"
+   DUMP="xenforo-pre-$RUN"
+   [ -f "$DUMP.sql.gz" ] \
+     || { echo "FATAL: no $DUMP.sql.gz here; step 1 did not leave one" >&2; exit 1; }
+
+   # gunzip refuses to clobber, so a leftover .sql from a previous attempt makes
+   # this exit non-zero and leaves the OLD dump in place for the import below.
+   rm -f "$DUMP.sql"
+   gunzip -k "$DUMP.sql.gz" \
+     || { echo "FATAL: could not decompress $DUMP.sql.gz" >&2; exit 1; }
+   tail -5 "$DUMP.sql" | grep -q '^-- Dump completed' \
+     || { echo "FATAL: no completion footer in $DUMP.sql; do not import it" >&2; exit 1; }
+
+   docker compose -f docker/compose.yaml up -d --wait db \
+     && docker compose -f docker/compose.yaml cp "$DUMP.sql" db:/tmp/dump.sql \
+     && docker compose -f docker/compose.yaml exec db sh -c \
+       'MYSQL_PWD="$MYSQL_PASSWORD" mysql -u "$MYSQL_USER" "$MYSQL_DATABASE" -e "source /tmp/dump.sql"' \
+     || { echo "FATAL: the import did not complete; this database is not the forum" >&2; exit 1; }
+   ```
+
+   **`RUN` is set in step 1, and step 2 is often a different shell** — a day later, a new terminal, after a reboot. `${RUN:?}` says so out loud instead of quietly building `xenforo-pre-.sql.gz`, and the `-f` test is the backstop, because an interactive shell survives a `:?` and carries on to the next line.
+
+   **`tail -5` was a thing to look at, not a check, and that is the difference that matters here.** The footer either is or is not there, and the answer decides whether the next command should run at all — so it is a `grep -q` with a guard on it, like every other instance of this check in this document. Printing five lines for a human to read is the same shape as printing a `wait` result instead of saving it: correct right up until the one time nobody looks.
+
+   **`--wait`, because `up -d` returns when the container is *started*, not when MySQL is accepting connections.** The `db` service declares a healthcheck precisely so something can wait on it; `--wait` is what consumes it. Without it the `cp` usually survives and the import races initialisation, which fails in a way that looks like a bad dump rather than a bad sequence.
+
+   **Resolve the password inside the container, not on your command line.** `-e MYSQL_PWD="$XF_DB_PASSWORD"` expands in your shell, so the credential lands in the host's process arguments where any local process can read it from `ps`. The `db` container already holds `MYSQL_PASSWORD`, `MYSQL_USER` and `MYSQL_DATABASE` from compose, so single-quoting the `sh -c` body defers expansion to the container and nothing crosses the boundary. (The nightly CronJob goes one better with a `--defaults-extra-file`, keeping the password out of the *container's* argv too; that is worth the extra lines for a recurring job and not for a throwaway rehearsal, but it is the stronger form if you copy this pattern somewhere durable.)
+
+   Address the stack by **compose file and service name**, never by container name. `docker-db-1` is a *generated* name: it is the project name plus the service plus an index, and the project name defaults to the containing directory — so it is `docker-db-1` only while you happen to be standing in `docker/`. Run the same `docker cp` from the component root, or under a `-p` flag, or alongside a second copy of the stack, and it addresses nothing or the wrong thing. `-f docker/compose.yaml` also lets every command in this runbook be pasted from one directory.
+
+   **Rehearse on the pinned image, not a local build.** `docker compose build` takes ~25 minutes; tagging the digest the cluster actually runs takes seconds and is strictly better fidelity:
+
+   ```bash
+   DIGEST=$(grep -A1 'name: ghcr.io/siliconsaga/xenforo-k8s' kustomize/base/kustomization.yaml \
+     | sed -n 's/.*digest: *//p')
+   [ -n "$DIGEST" ] || { echo "FATAL: no digest in kustomization.yaml" >&2; exit 1; }
+
+   docker pull "ghcr.io/siliconsaga/xenforo-k8s@$DIGEST" \
+     && docker tag "ghcr.io/siliconsaga/xenforo-k8s@$DIGEST" xenforo-k8s:local \
+     && docker compose -f docker/compose.yaml up -d --no-build xenforo caddy \
+     || { echo "FATAL: the rehearsal is not running the pinned image" >&2; exit 1; }
+   ```
+
+   **Chained, because `--no-build` starts whatever `xenforo-k8s:local` happens to be.** If the pull or the tag fails, an ungated `up` finds the tag a previous `docker compose build` left behind and starts it, and the rehearsal reports on an image the cluster is not running — the one thing this whole paragraph exists to prevent. The `-n "$DIGEST"` check guards the two lines above it: a `grep`/`sed` pair that matches nothing yields an *empty* digest rather than an error, and `xenforo-k8s@` with nothing after it fails further along than it should.
+
+   Then unpack the release's `upload/` over `docker/xf/` and run the migration **inside that container**, which is the whole point of pinning it:
+
+   ```bash
+   docker compose -f docker/compose.yaml exec -w /var/www/html xenforo \
+     php cmd.php xf:upgrade --no-interaction --skip-statistics
+   ```
+
+   A bare `php cmd.php` on the host runs whatever PHP the workstation has — a different version, without the image's extensions, and on macOS usually none at all. The rehearsal is only worth something if it runs on the same PHP the cluster will. Confirm the forum renders on `http://localhost:8080/` before going near the cluster.
+
+   **Compare raw row counts, not the forum's own figures.** `xf_user`, `xf_post`, `xf_thread`, `xf_attachment` and `xf_template` must be identical across the migration. The rendered stat block is filtered and will not show you a loss — it reported 2,965 "Members" against 29,026 rows in `xf_user`, because the difference is unconfirmed and rejected registrations.
+
+3. **Put the forum in maintenance mode** from the admin control panel, or accept errors during the migration. The window is short — both 2.3.13 migration steps finished in well under a minute on a 16.5k-post database — so for a forum that is not yet the public hostname this step is a judgement call rather than a requirement. Check what `kubectl -n xenforo get httproute` answers before deciding.
+
+4. **Copy the new files in**, over the top of the existing tree. Release archives nest everything under `upload/`, so strip that level; and tar one file in rather than `cp`-ing a directory, which is both faster and far less likely to truncate:
+
+   ```bash
+   rm -f xf-new.tgz
+   COPYFILE_DISABLE=1 tar -czf xf-new.tgz -C ./xenforo-2.3.y/upload . \
+     && kubectl -n xenforo exec "$POD" -c php-fpm -- rm -f /tmp/xf-new.tgz \
+     && kubectl -n xenforo cp ./xf-new.tgz "$POD:/tmp/xf-new.tgz" -c php-fpm --retries=5 \
+     && kubectl -n xenforo exec "$POD" -c php-fpm -- ls -l /tmp/xf-new.tgz \
+     && ls -l xf-new.tgz \
+     && kubectl -n xenforo exec "$POD" -c php-fpm -- gzip -t /tmp/xf-new.tgz \
+     || { echo "FATAL: the release never landed intact; do not extract" >&2; exit 1; }
+   ```
+
+   Compare the two sizes it printed — then, and only then, extract over the live tree:
+
+   ```bash
+   kubectl -n xenforo exec "$POD" -c php-fpm -- tar -xzf /tmp/xf-new.tgz -C /var/www/html \
+     || { echo "FATAL: extract failed partway; the tree is a mixture of two releases" >&2; exit 1; }
+   ```
+
+   **Both `rm -f`s, and the gate between copying and extracting, are the same lesson as the rehearsal copy in step 2 — and it is worse here, because this tree is the live forum.** Ungated, a failed local `tar` or a failed `cp` leaves `gzip -t` and `tar -xzf` running against whatever `/tmp/xf-new.tgz` the pod already had: a complete, valid archive of some *earlier* release, extracted over a running install. It passes `gzip -t`, it extracts without complaint, and the migration in step 5 then runs against a tree that is neither version. The extraction is a separate paste on purpose, so the byte comparison is something you do rather than something the chain scrolls past.
+
+   XenForo release archives are meant to be unpacked over an existing install. Do not delete the tree first — `internal_data/` and `data/` hold your attachments, and `src/config.php` is not in the archive, so an overlay leaves it alone. Confirm that last point rather than trust it; without `config.php` the forum cannot reach its database at all.
+
+   ⚠ **Fix ownership afterwards — the tarball does not save you from this, it only moves it.** `kubectl cp` lands files as your *local* uid/gid, and `tar` run as root faithfully restores whatever uid/gid the archive recorded, so a tarball built on a workstation extracts as that workstation's user. After the 2.3.13 extract the tree read `502 wheel` with the setgid bit and group-write gone (`drwxr-xr-x` where it had been `drwxrwsr-x`). The forum still *served*, because `other` keeps read — which is exactly why this is easy to miss.
+
+   **XenForo needs exactly three paths writable: `internal_data/`, `data/`, and `src/addons/`** (the last only to install add-ons through the ACP). Everything else is application code, and php-fpm runs as `www-data` — so group-write on the code means the process serving the forum can rewrite the code serving the forum. Restore the two sets separately, code first so the writable paths win where they nest under `src/`:
+
+   ```bash
+   # Application code: owned by root, readable by php-fpm, NOT writable by it.
+   # The archive's own top level IS the list of what was just extracted, so
+   # derive it rather than maintaining a copy that can drift.
+   kubectl -n xenforo exec "$POD" -c php-fpm -- sh -c '
+     set -eu
+     cd /var/www/html
+     CODE=$(tar -tzf /tmp/xf-new.tgz | sed -n "s|^\./\([^/][^/]*\)/\{0,1\}$|\1|p")
+     chown -R root:www-data $CODE
+     find $CODE -type d -exec chmod 755 {} +
+     find $CODE -type f -exec chmod 644 {} +
+   '
+
+   # The three XenForo writes to. setgid so new files inherit the group.
+   kubectl -n xenforo exec "$POD" -c php-fpm -- \
+     chown -R www-data:www-data /var/www/html/internal_data /var/www/html/data /var/www/html/src/addons
+   kubectl -n xenforo exec "$POD" -c php-fpm -- \
+     find /var/www/html/internal_data /var/www/html/data /var/www/html/src/addons -type d -exec chmod 2775 {} +
+   ```
+
+   For 2.3.13 that derives 20 entries — `admin.php`, `cmd.php`, `connected_account.php`, `css.php`, `embed.php`, `htaccess.txt`, `index.php`, `install`, `job.php`, `js`, `library`, `oembed.php`, `payment_callback.php`, `proxy.php`, `service_worker.js`, `sitemap.php`, `src`, `styles`, `unfurl.php`, `webmanifest.php`.
+
+   **Scope it to the release, not to the volume.** `chown -R root:www-data /var/www/html` is the tempting shortcut and it is wrong twice over: it walks the 855MB of `internal_data` for no reason, and it strips the setgid bit and resets file modes across every attachment before the three-path repair below puts *directories* back — file modes it never restores. Deriving the list from the tarball touches exactly what was written and nothing else, and it keeps working when a future XenForo adds a top-level directory that a hand-maintained list would silently miss.
+
+   `config.php` needs no special case under this scheme — `644` falls out of the code rule, and the code rule is the right one for it: it is application code, and it does **not** hold the database password. The image generates it from the environment, and `getenv_docker()` resolves `XF_DB_PASSWORD_FILE` to the mounted secret at runtime (`image/config.php:45`), so the credential is never written into the file to be protected in the first place. Under the older blanket `664` it had to be clawed back by hand, which is a good sign the blanket was wrong.
+
+   ⚠ **The *modes* above do not survive the next pod start, and no runbook step can make them.** `base/deployment.yaml` sets `fsGroup: 82` with the default `fsGroupChangePolicy`, so kubelet walks the whole volume at every mount and ORs `g+rw` into every file and `g+rwx` plus setgid into every directory. (Kubelet skips that walk entirely for a CSI driver advertising `VOLUME_MOUNT_GROUP`, which takes `fsGroup` over as a mount option and makes `fsGroupChangePolicy` a no-op. This cluster's `standard-rwo` is `pd.csi.storage.gke.io`, which does not — and the modes below are themselves the proof that something walked them.) A `644` file is `664` again before php-fpm serves its first request — step 6's restart is enough to undo this chmod, and this document said the opposite until Copilot pointed it out.
+
+   Read off the live forum on 2026-11-04, which is what makes it more than a reading of the API docs:
+
+   ```text
+   2775 UNKNOWN:www-data  /var/www/html
+    664 root:www-data     /var/www/html/index.php
+   2775 root:www-data     /var/www/html/src
+    664 root:www-data     /var/www/html/src/XF.php
+   2775 www-data:www-data /var/www/html/internal_data
+   ```
+
+   The volume root is still owned by the *workstation* uid that `kubectl cp` left — `UNKNOWN` because no such user exists in the container — while its group is `www-data`. That combination is only what `chown(-1, fsGroup)` produces: uid untouched, gid forced to 82. So the group-write on code was never "how the install was seeded"; it is re-created on every mount, which also explains why the `drwxr-xr-x 502 wheel` recorded right after the 2.3.13 extract is not what the tree reads today. (That the volume root alone kept the foreign uid is the derived `$CODE` list behaving as designed — `.` was never in it.)
+
+   **So run the block for the ownership, and do not count on the modes.** `chown` is the half that persists: `fsGroup` never touches uid, and it sets exactly the gid the code rule wants anyway. Making code durably non-writable by php-fpm is a *manifest* change, not a runbook step — either `fsGroupChangePolicy: OnRootMismatch`, which skips the recursive walk once the volume root already matches and so leaves inner modes alone, or dropping `fsGroup` and having the init container chown the three writable paths itself. Both are deliberate changes to how a live forum's volume is owned, to make with a Velero snapshot in hand and on their own, not folded into an upgrade.
+
+   `COPYFILE_DISABLE=1` is a macOS detail: without it `tar` embeds AppleDouble xattrs and busybox in the pod prints one `Ignoring unknown extended header keyword` line per file, burying any real error in thousands of lines of noise.
 
 5. **Run the migration:**
 
    ```bash
-   kubectl -n xenforo exec deploy/xenforo -c php-fpm -- php cmd.php xf:upgrade
+   kubectl -n xenforo exec deploy/xenforo -c php-fpm -- \
+     php /var/www/html/cmd.php xf:upgrade --no-interaction --skip-statistics
    ```
+
+   It prints `Current version:` from the **database** and `Upgrade target:` from `src/XF.php`, which is the clearest confirmation that step 4 actually landed. Re-running it once the versions match is safe — it degrades to a template and phrase rebuild rather than re-applying steps.
 
 6. **Restart** so opcache and the template cache are rebuilt cleanly:
 
    ```bash
    kubectl -n xenforo rollout restart deploy/xenforo
+   kubectl -n xenforo rollout status deploy/xenforo --timeout=300s
    ```
+
+   The `rollout status` is part of the step, not a flourish. `rollout restart` returns as soon as the Deployment is updated, and this Deployment is **`Recreate`** (a rolling update would try to attach the same RWO volume twice) — so for a few seconds the only pod in the namespace is `Terminating`, and shortly after that the only pod is `Pending`. Step 7 runs against whichever pod it finds.
 
 7. **Refresh XenForo's CA bundle** — the upgrade just overwrote it with the release's snapshot:
 
    ```bash
+   scripts/refresh-ca-bundle.sh --check   # expect exit 1, "stale: refresh needed"
    scripts/refresh-ca-bundle.sh
    ```
+
+   ⚠ **Do not start this before the rollout above has settled.** `refresh-ca-bundle.sh` selects the first matching pod and `exec`s into it; against a `Terminating` or `Pending` pod that fails, and the failure reads as a broken script rather than a mistimed one. The script trusts its caller on this — it does not wait for readiness itself — so the `rollout status` in step 6 is what makes step 7 deterministic.
+
+   This is not precautionary. Measured inside the 2.3.13 container on 2026-11-04, against the same host, in the same shell:
+
+   | trust store | result |
+   | --- | --- |
+   | system store (patched image) | exit 60, `verify=20` — **rejected** |
+   | `src/XF/Http/ca-bundle.crt` as shipped in 2.3.13 | exit 0, `verify=0`, `code=200` — **accepted** |
+
+   The release archive still carries all four emSign roots (`Root CA - G1`, `ECC Root CA - G3`, `Root CA - C1`, `ECC Root CA - C3`). So a clean, fully patched image running an upgraded forum is still trusting the compromised chain on every outbound request XenForo makes, until this step runs.
+
+8. **Merge the outdated templates** in the ACP. The upgrade reports them and they are not an error, but customised templates stay on the old version until someone merges them, and new features can misbehave until they do. For 2.3.13 it was three.
 
 ## XenForo's own CA bundle, and why step 7 is not optional
 
@@ -71,7 +627,9 @@ Three consequences worth internalising:
 - **Rebuilding the image does not touch it either**, because the forum tree lives on the PersistentVolume. The bundle is only as fresh as the release that unpacked it.
 - **A XenForo upgrade resets it** to that release's snapshot, which is why the refresh is a numbered step above rather than a one-off.
 
-This stopped being theoretical on 2026-10-20. The eMudhra CA compromise (CVE-2026-111943) put eight recoverable intermediate CA keys in circulation, and the shipped bundle still trusted `emSign ECC Root CA - G3`, the root they cross-sign up to. Verified against the live pod: XF's bundle accepted a certificate chaining to a compromised intermediate while the same request through the system store also did. Two stores, two fixes.
+This stopped being theoretical on 2026-10-20. The eMudhra CA compromise (CVE-2026-111943) put eight recoverable intermediate CA keys in circulation, and the shipped bundle still trusted `emSign ECC Root CA - G3`, the root they cross-sign up to. Verified against the live pod on 2026-10-26: XF's bundle accepted a chain built on a compromised intermediate, and so did the system store. Two stores, two fixes.
+
+The two fixes have since landed at different times, which is what makes the split concrete rather than theoretical. Patching the image fixed the system store and left XenForo's untouched; upgrading XenForo reset its bundle back to a vulnerable snapshot without affecting the system store. Step 7 above records both halves measured in the same container, in opposite states, on 2026-11-04.
 
 `scripts/refresh-ca-bundle.sh` installs the current [curl extract](https://curl.se/docs/caextract.html), which is what XenForo's own `ca-bundle-readme.txt` says to do, and regenerates `ca-bundle-legacy-openssl.crt` as bundle + `legacy-equifax.crt` (that variant exists so Google endpoints validate on OpenSSL older than 1.0.2).
 

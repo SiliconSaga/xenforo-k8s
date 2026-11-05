@@ -1,0 +1,38 @@
+# .github/workflows/docs.yml
+#
+# The docs here are runbooks, and their shell blocks get pasted into a terminal
+# mid-upgrade or mid-incident. `bash -n` parses them without running anything,
+# which catches the class of defect that reading does not: an angle-bracket
+# placeholder (`<digest>` is redirection), an apostrophe that closes a
+# single-quoted `sh -c` body early, an unterminated fence.
+#
+# Three rounds of PR review on #5 found those by eye. This job is cheap enough
+# — bash and a checkout, no toolchain — that it should not have been review's
+# job in the first place.
+name: docs
+on:
+  push:
+    branches: [main]
+    paths:
+      - '**.md'
+      - 'tests/lint-runbooks.sh'
+      - '.github/workflows/docs.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - '**.md'
+      - 'tests/lint-runbooks.sh'
+      - '.github/workflows/docs.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lint-runbooks:
+    runs-on: ubuntu-latest
+    steps:
+    # The script asks git which Markdown files are tracked, so it needs a real
+    # checkout — but only one commit of it.
+    - uses: actions/checkout@v4
+    - run: tests/lint-runbooks.sh

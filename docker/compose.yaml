@@ -25,6 +25,10 @@ services:
       XF_TITLE: ${XF_TITLE:-XenForo}
       XF_COOKIE_PREFIX: ${XF_COOKIE_PREFIX:-xf_}
       XF_DEBUG: ${XF_DEBUG:-}
+    # The port lives here, not on caddy, because caddy shares THIS service's
+    # network namespace (see below). Published from the namespace that owns it.
+    ports:
+      - "${HTTP_PORT:-8080}:8080"
     volumes:
       - ./xf:/var/www/html
       # Mounted rather than copied by an init step, because compose has no init
@@ -33,10 +37,32 @@ services:
 
   caddy:
     image: caddy:2.11-alpine
+    # Long form, because `restart: true` is the half that matters. Sharing a
+    # network namespace (below) means restarting `xenforo` tears down the very
+    # namespace this container lives in, and caddy stays attached to the dead
+    # one while the published port moves to the new one. Measured: `docker
+    # restart docker-xenforo-1` leaves caddy reporting `Up 17 seconds` and the
+    # port answering curl 52, empty reply — not a 502, because nothing is
+    # listening in the namespace the port now belongs to. Compose only
+    # propagates the restart if asked, and `docker compose restart xenforo`
+    # with this block restarts both and comes back 200.
+    #
+    # `service_started`, not `service_healthy`: php-fpm declares no healthcheck,
+    # and waiting on one that does not exist hangs. Needs Compose v2.17+.
     depends_on:
-      - xenforo
-    ports:
-      - "${HTTP_PORT:-8080}:8080"
+      xenforo:
+        condition: service_started
+        restart: true
+    # ⚠ Load-bearing, and the reason this file cannot just list a `ports:` of
+    # its own. The shared Caddyfile says `php_fastcgi 127.0.0.1:9000` because in
+    # the Kubernetes flavors caddy is a SIDECAR in the xenforo pod, sharing one
+    # loopback with php-fpm. Compose gives each service its own, so without this
+    # caddy dials its own empty 127.0.0.1:9000 and every request returns 502
+    # while both containers report healthy — php-fpm logs "ready to handle
+    # connections" and never sees a request. Joining xenforo's namespace
+    # reproduces the pod rather than diverging from it; rewriting the upstream to
+    # `xenforo:9000` would work here and silently stop testing the real config.
+    network_mode: "service:xenforo"
     volumes:
       - ../image/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
       - ./xf:/var/www/html:ro

@@ -16,9 +16,29 @@ resources:
   - ingress.yaml
   - pvc.yaml
 
+# Pinned by digest, not `latest`, and the eMudhra incident is why.
+#
+# With `newTag: latest` the pod spec never changes, so Kubernetes defaults
+# imagePullPolicy to Always and whatever CI last published becomes what the
+# cluster runs at the next restart — silently, with nothing in git recording it
+# and nothing to roll back to. That is how this deployment sat on an image
+# carrying ca-certificates 20260909-r0 and PHP 8.4.26 (CVE-2026-109618/109619,
+# unauthenticated RCE) while `latest` had moved on: the running version was
+# unreviewable, so nobody reviewed it.
+#
+# The cost is that a security rebuild no longer reaches the cluster on its own —
+# bumping this line is now a deliberate, reviewable act. That is the trade we
+# want: `latest` did not actually keep us current, it just kept us uninformed.
+# See docs/upgrades.md for the bump-and-verify procedure.
+#
+# This is the multi-arch INDEX digest, not a per-platform one, so amd64 GKE
+# nodes and arm64 k3d dev clusters both resolve correctly from the same pin.
+#
+# Verified before pinning (in-cluster, 2026-11-03): PHP 8.4.27,
+# ca-certificates 20261020-r0, compromised test chain rejected (verify=20).
 images:
   - name: ghcr.io/siliconsaga/xenforo-k8s
-    newTag: latest
+    digest: sha256:f97e86d5e56828d13a33e9ba51996c3bd674f981d340e1d1bd13f0e5bf529e49
 
 labels:
   - pairs:
