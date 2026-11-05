@@ -106,18 +106,28 @@ CI rebuilds `ghcr.io/siliconsaga/xenforo-k8s` on every push to `image/`, and wee
    With no working Docker, run it as a throwaway pod on the digest — which also tests exactly what the cluster will pull. **Probe once per architecture the cluster can schedule on, and pin each probe to one.** An unpinned pod lands wherever the scheduler puts it, so on a mixed-arch cluster it can verify one variant while `deploy/xenforo` later pulls the other — a green check on an image the forum never runs. Read the list off the nodes rather than naming it, because the base Deployment sets no `nodeSelector` and no affinity, so every node is eligible:
 
    ```bash
+   DIGEST=sha256:...        # the index digest from step 1; this block stands alone
+
    VERIFY=$(cat verify-image.sh) \
      || { echo "FATAL: cannot read verify-image.sh" >&2; exit 1; }
    [ -n "$VERIFY" ] || { echo "FATAL: verify-image.sh is empty; nothing would be checked" >&2; exit 1; }
 
-   # Not one pipeline: `kubectl ... | sort -u` reports SORT's status, and sort
-   # succeeds on no input, so a Forbidden or unreachable node query would leave
-   # ARCHES empty, run zero probes, and exit 0. Measured, with a kubectl that
-   # exits 1: probes run 0, verdict verified.
-   ARCHES=$(kubectl get nodes \
-     -o jsonpath='{range .items[*]}{.metadata.labels.kubernetes\.io/arch}{"\n"}{end}') \
-     || { echo "FATAL: could not list nodes; set ARCHES by hand (below)" >&2; exit 1; }
-   ARCHES=$(printf '%s\n' "$ARCHES" | sort -u)
+   # Ask the cluster only if you have not answered already, so that the manual
+   # fallback below is not overwritten the moment you re-paste this block.
+   #
+   # And not as one pipeline: `kubectl ... | sort -u` reports SORT's status, and
+   # sort succeeds on no input, so a Forbidden or unreachable node query would
+   # leave ARCHES empty, run zero probes, and exit 0. Measured, with a kubectl
+   # that exits 1: probes run 0, verdict verified.
+   if [ -z "${ARCHES:-}" ]; then
+     ARCHES=$(kubectl get nodes \
+       -o jsonpath='{range .items[*]}{.metadata.labels.kubernetes\.io/arch}{"\n"}{end}') \
+       || { echo "FATAL: could not list nodes; set ARCHES by hand (below)" >&2; exit 1; }
+   fi
+   # Normalise to one arch per line before testing it, because `[ -n ]` on a
+   # whitespace-only value is TRUE while `for ARCH in $ARCHES` iterates zero
+   # times — the same fail-open with a different disguise.
+   ARCHES=$(printf '%s\n' "$ARCHES" | tr -s '[:space:]' '\n' | sed '/^$/d' | sort -u)
    [ -n "$ARCHES" ] || { echo "FATAL: no node architectures; refusing to verify nothing" >&2; exit 1; }
    echo "probing: $ARCHES"
 
@@ -139,7 +149,7 @@ CI rebuilds `ghcr.io/siliconsaga/xenforo-k8s` on every push to `image/`, and wee
    [ "$rc" = 0 ] || { echo "FATAL: an architecture probe failed" >&2; exit 1; }
    ```
 
-   **`nodes` is a cluster-scoped read, so expect `Forbidden` rather than an answer** if you hold the namespace-scoped access [`README.md`](../README.md) hands out — which is the common case for anyone who is not the cluster admin. That is a normal reply, not a broken cluster, and the guard above turns it into a stop rather than a pass. Name the architectures yourself and carry on:
+   **`nodes` is a cluster-scoped read, so expect `Forbidden` rather than an answer** if you hold the namespace-scoped access [`README.md`](../README.md) hands out — which is the common case for anyone who is not the cluster admin. That is a normal reply, not a broken cluster, and the guard above turns it into a stop rather than a pass. Name the architectures yourself, **then** paste the block above again — the `if [ -z "${ARCHES:-}" ]` is what keeps your answer from being overwritten by the same failing query:
 
    ```bash
    ARCHES=amd64        # or 'amd64 arm64' — what you know the cluster runs
@@ -551,7 +561,7 @@ EOF
 
    `config.php` needs no special case under this scheme — `644` falls out of the code rule, and the code rule is the right one for it: it is application code, and it does **not** hold the database password. The image generates it from the environment, and `getenv_docker()` resolves `XF_DB_PASSWORD_FILE` to the mounted secret at runtime (`image/config.php:45`), so the credential is never written into the file to be protected in the first place. Under the older blanket `664` it had to be clawed back by hand, which is a good sign the blanket was wrong.
 
-   ⚠ **The *modes* above do not survive the next pod start, and no runbook step can make them.** `base/deployment.yaml` sets `fsGroup: 82` with the default `fsGroupChangePolicy`, so kubelet walks the whole volume at every mount and ORs `g+rw` into every file and `g+rwx` plus setgid into every directory. A `644` file is `664` again before php-fpm serves its first request — step 6's restart is enough to undo this chmod, and this document said the opposite until Copilot pointed it out.
+   ⚠ **The *modes* above do not survive the next pod start, and no runbook step can make them.** `base/deployment.yaml` sets `fsGroup: 82` with the default `fsGroupChangePolicy`, so kubelet walks the whole volume at every mount and ORs `g+rw` into every file and `g+rwx` plus setgid into every directory. (Kubelet skips that walk entirely for a CSI driver advertising `VOLUME_MOUNT_GROUP`, which takes `fsGroup` over as a mount option and makes `fsGroupChangePolicy` a no-op. This cluster's `standard-rwo` is `pd.csi.storage.gke.io`, which does not — and the modes below are themselves the proof that something walked them.) A `644` file is `664` again before php-fpm serves its first request — step 6's restart is enough to undo this chmod, and this document said the opposite until Copilot pointed it out.
 
    Read off the live forum on 2026-11-04, which is what makes it more than a reading of the API docs:
 

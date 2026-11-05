@@ -74,6 +74,12 @@ trap 'rm -f "$block_file" "$err_file"' EXIT
 # contents decide whether this is a fence at all — see the backtick check below.
 fence_re='^([[:space:]]*)(`{3,}|~{3,})(.*)$'
 
+# An HTML comment block has to BEGIN a line (CommonMark 4.6 type 2), which is
+# what keeps a sentence mentioning `<!--` in inline code from putting this
+# scanner into comment mode until some later line happens to contain `-->` —
+# silently skipping every block in between.
+comment_re='^[[:space:]]*<!--'
+
 total=0
 bad=0
 checked_files=0
@@ -115,7 +121,7 @@ for md in "${files[@]}"; do
         fi
         continue
       fi
-      if [[ "$line" == *"<!--"* && "$line" != *"-->"* ]]; then
+      if [[ "$line" =~ $comment_re && "$line" != *"-->"* ]]; then
         in_comment=1
         comment_start=$lineno
         continue
