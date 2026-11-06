@@ -23,10 +23,40 @@ spec:
         app: xenforo
     spec:
       securityContext:
-        # 82 is www-data in the php:*-fpm-alpine images. fsGroup makes the mounted
-        # volume group-writable by that user, which is what lets XenForo write
-        # attachments and its template cache without running as root.
+        # 82 is www-data in the php:*-fpm-alpine images, and it is the uid AND the
+        # primary gid the php-fpm WORKERS run as — the master stays root, but `ps`
+        # in the pod shows `www-data www-data` for every `pool www` process.
+        # fsGroup is what lets those workers write attachments and the template
+        # cache without the pool running as root.
         fsGroup: 82
+        # OnRootMismatch, because the default (Always) is not a one-time seeding
+        # step: kubelet walks the ENTIRE volume on every single mount and ORs
+        # `g+rw` into every file, `g+rwx` plus setgid into every directory
+        # (rwMask 0660 | execMask 0110 in pkg/volume/volume_linux.go). That is
+        # why `stat` on the live tree reads `664 root:www-data` for files and
+        # `2775` for directories, and why tightening a mode by hand lasted
+        # exactly until the next pod start.
+        #
+        # OnRootMismatch stats the volume ROOT instead and skips the walk when it
+        # already matches — gid == fsGroup, setgid set, group bits covering 0770
+        # (skipPermissionChange / requiresPermissionChange, same file). The live
+        # root is `2775 ...:www-data`, exactly what a completed walk leaves, so
+        # the walk is skipped from the first mount after this lands.
+        #
+        # It grants nothing and revokes nothing today: every file on the volume
+        # has already been through the walk, so it carries gid 82 and at least
+        # `664`, and the workers keep the access they have. What changes is the
+        # future — a mode someone tightens stays tightened, and the tree that
+        # `kubectl cp` writes as root during an upgrade stays `644`/`755`
+        # root-owned rather than being made group-writable. World-readable is
+        # all the workers need for code; the three paths they actually write to
+        # are chowned by the init container below, which this makes load-bearing
+        # rather than belt-and-braces.
+        #
+        # A fresh PVC is unaffected: its root is neither gid 82 nor setgid, so
+        # the first mount mismatches and does the full walk, which is what
+        # seeding a new volume wants. See docs/upgrades.md.
+        fsGroupChangePolicy: OnRootMismatch
       initContainers:
         - name: config-sync
           image: ghcr.io/siliconsaga/xenforo-k8s:latest
@@ -46,10 +76,14 @@ spec:
                 echo "XenForo source not present yet — skipping config.php install"
               fi
 
-              # `kubectl cp` writes as root, and fsGroup only fixes the volume root
-              # — not files created inside it afterwards. Without this, PHP (uid 82)
-              # cannot write attachments or its template cache, and the forum fails
-              # in ways that look like XenForo bugs rather than permissions.
+              # `kubectl cp` writes as root, and fsGroup only ever changes the
+              # GROUP of what it touches — never the owner — so a copied-in tree
+              # comes out root-owned. With fsGroupChangePolicy: OnRootMismatch
+              # above, kubelet no longer walks the volume either, so this chown
+              # is now the ONLY thing granting PHP (uid 82) write access: remove
+              # it and the forum fails to write attachments or its template
+              # cache, in ways that look like XenForo bugs rather than
+              # permissions.
               #
               # Only these three paths, not the whole tree: PHP having no write
               # access to its own code is a feature, and a recursive chown over a
