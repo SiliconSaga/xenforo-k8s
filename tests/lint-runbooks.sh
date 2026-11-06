@@ -27,10 +27,125 @@
 # the test is "could this be pasted", not "is this complete".
 #
 # Usage: tests/lint-runbooks.sh [file.md ...]      (default: every *.md here)
+#        tests/lint-runbooks.sh --self-test        (check this parser itself)
 set -euo pipefail
 
+# Absolute, and captured before the cd, because --self-test re-invokes this
+# script by path and "$0" may well be a relative one.
+SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
+
+# --- Self-test ---------------------------------------------------------------
+# This parser has been wrong four times, and every time by SKIPPING a block
+# rather than by misjudging one: a ```bash inside a ```text block, a ```text
+# inside an HTML comment, a ```text``` code span read as an opener, and a
+# `<!--` in mid-sentence prose. Each of those reported *nothing* — a false
+# pass, the one failure mode a check like this cannot survive, because a clean
+# run is indistinguishable from a run that checked nothing.
+#
+# Review caught all four by eye. These fixtures are so it does not have to
+# again. Each is a document whose correct verdict is known and recorded in
+# tests/fixtures/expected.tsv, and the whole script is re-invoked on it, so
+# what gets tested is the real entry point and not a copy of its logic.
+self_test() {
+  local fixtures_dir="$ROOT/tests/fixtures"
+  local table="$fixtures_dir/expected.tsv"
+  local fail=0
+
+  if [[ ! -f "$table" ]]; then
+    echo "ERROR: no expectation table at $table" >&2
+    return 2
+  fi
+
+  # Every fixture needs a row, and every row a fixture. Walking the table alone
+  # would let a newly added fixture sit unchecked; walking the directory alone
+  # would let a row name a file that is no longer there.
+  local -a on_disk=()
+  local f
+  shopt -s nullglob
+  for f in "$fixtures_dir"/*.md; do
+    on_disk+=("$(basename "$f")")
+  done
+  shopt -u nullglob
+
+  if (( ${#on_disk[@]} == 0 )); then
+    echo "ERROR: no fixtures found under $fixtures_dir" >&2
+    return 2
+  fi
+
+  local -a listed=()
+  local name want_exit want_blocks want_bad
+  local out rc got_blocks got_bad
+  while IFS=$'\t' read -r name want_exit want_blocks want_bad; do
+    [[ -z "$name" || "$name" == \#* ]] && continue
+    listed+=("$name")
+
+    if [[ ! -f "$fixtures_dir/$name" ]]; then
+      echo "FAIL $name"
+      echo "    listed in expected.tsv but not on disk"
+      fail=1
+      continue
+    fi
+
+    rc=0
+    out="$("$SELF" "$fixtures_dir/$name" 2>&1)" || rc=$?
+
+    # Counts, not just the exit status. A parser that stopped tracking ```text
+    # blocks still exits 1 on fixture-bad.md — for the wrong reason, with the
+    # wrong number of blocks. The counts are what notice that.
+    got_blocks="$(sed -n 's/^Summary: \([0-9]*\) shell block.*/\1/p' <<<"$out")"
+    got_bad="$(sed -n 's/^Summary: .*, \([0-9]*\) with syntax errors$/\1/p' <<<"$out")"
+
+    if [[ "$rc" == "$want_exit" && "$got_blocks" == "$want_blocks" && "$got_bad" == "$want_bad" ]]; then
+      printf 'ok   %-26s exit %s, %s block(s), %s bad\n' "$name" "$rc" "$got_blocks" "$got_bad"
+      continue
+    fi
+
+    echo "FAIL $name"
+    printf '    wanted exit %s, %s block(s), %s bad\n' "$want_exit" "$want_blocks" "$want_bad"
+    printf '    got    exit %s, %s block(s), %s bad\n' "$rc" "${got_blocks:-?}" "${got_bad:-?}"
+    sed 's/^/    | /' <<<"$out"
+    fail=1
+  done <"$table"
+
+  if (( ${#listed[@]} == 0 )); then
+    echo "ERROR: $table lists no fixtures" >&2
+    return 2
+  fi
+
+  local l found
+  for f in "${on_disk[@]}"; do
+    found=0
+    for l in "${listed[@]}"; do
+      [[ "$l" == "$f" ]] && found=1 && break
+    done
+    if (( found == 0 )); then
+      echo "FAIL $f"
+      echo "    on disk but not listed in expected.tsv — its verdict is unchecked"
+      fail=1
+    fi
+  done
+
+  echo
+  if (( fail == 0 )); then
+    echo "Self-test: ${#on_disk[@]} fixture(s), every verdict correct"
+    return 0
+  fi
+  echo "Self-test: this parser's verdict is wrong on at least one fixture"
+  return 1
+}
+
+if [[ "${1:-}" == "--self-test" ]]; then
+  if (( $# > 1 )); then
+    echo "ERROR: --self-test takes no other arguments" >&2
+    exit 2
+  fi
+  self_test
+  exit $?
+fi
+# --- End self-test -----------------------------------------------------------
+
 
 if (( $# > 0 )); then
   files=("$@")
@@ -43,11 +158,16 @@ else
   # read as a failure of this repo. Asking git means the check covers exactly
   # what review covers.
   #
+  # tests/fixtures/ is excluded because those files are WRONG on purpose —
+  # they are the inputs to --self-test, and sweeping them would make a
+  # correct linter report a failing repo. They are still checked, just
+  # against their recorded verdicts rather than against bash -n.
+  #
   # -z/-d '' so a path containing a space survives.
   files=()
   while IFS= read -r -d '' f; do
     files+=("$f")
-  done < <(git ls-files -z '*.md')
+  done < <(git ls-files -z '*.md' ':(exclude)tests/fixtures/*')
 
   if (( ${#files[@]} == 0 )); then
     echo "ERROR: git tracks no Markdown files here (is this a git checkout?)" >&2

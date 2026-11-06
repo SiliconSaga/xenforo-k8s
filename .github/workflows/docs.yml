@@ -16,12 +16,14 @@ on:
     paths:
       - '**.md'
       - 'tests/lint-runbooks.sh'
+      - 'tests/fixtures/**'
       - '.github/workflows/docs.yml'
   pull_request:
     branches: [main]
     paths:
       - '**.md'
       - 'tests/lint-runbooks.sh'
+      - 'tests/fixtures/**'
       - '.github/workflows/docs.yml'
   workflow_dispatch:
 
@@ -35,4 +37,10 @@ jobs:
     # The script asks git which Markdown files are tracked, so it needs a real
     # checkout — but only one commit of it.
     - uses: actions/checkout@v4
+    # Checks the parser before trusting it. Every bug it has had was a SKIPPED
+    # block rather than a misjudged one, so a sweep reporting "0 with syntax
+    # errors" is indistinguishable from a sweep that checked nothing. The
+    # fixtures under tests/fixtures/ each reproduce one of those shapes and
+    # carry the verdict the parser owes them.
+    - run: tests/lint-runbooks.sh --self-test
     - run: tests/lint-runbooks.sh
