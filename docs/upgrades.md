@@ -533,7 +533,7 @@ EOF
 
    ⚠ **Fix ownership afterwards — the tarball does not save you from this, it only moves it.** `kubectl cp` lands files as your *local* uid/gid, and `tar` run as root faithfully restores whatever uid/gid the archive recorded, so a tarball built on a workstation extracts as that workstation's user. After the 2.3.13 extract the tree read `502 wheel` with the setgid bit and group-write gone (`drwxr-xr-x` where it had been `drwxrwsr-x`). The forum still *served*, because `other` keeps read — which is exactly why this is easy to miss.
 
-   **XenForo needs exactly three paths writable: `internal_data/`, `data/`, and `src/addons/`** (the last only to install add-ons through the ACP). Everything else is application code, and php-fpm runs as `www-data` — so group-write on the code means the process serving the forum can rewrite the code serving the forum. Restore the two sets separately, code first so the writable paths win where they nest under `src/`:
+   **XenForo needs exactly three paths writable: `internal_data/`, `data/`, and `src/addons/`** (the last only to install add-ons through the ACP). Everything else is application code, and php-fpm runs as `www-data` — so group-write on the code means the process serving the forum can rewrite the code serving the forum. Restore the three sets separately, code first so the writable paths win where they nest under `src/`:
 
    ```bash
    # Application code: owned by root, readable by php-fpm, NOT writable by it.
@@ -553,6 +553,13 @@ EOF
      chown -R www-data:www-data /var/www/html/internal_data /var/www/html/data /var/www/html/src/addons
    kubectl -n xenforo exec "$POD" -c php-fpm -- \
      find /var/www/html/internal_data /var/www/html/data /var/www/html/src/addons -type d -exec chmod 2775 {} +
+
+   # And the volume ROOT, which $CODE deliberately excludes — `.` is never in
+   # that list — and which the extract just reset to the workstation's uid, gid
+   # and mode from the archive's own `./` entry. This is the one directory
+   # fsGroupChangePolicy compares against, so it is not cosmetic.
+   kubectl -n xenforo exec "$POD" -c php-fpm -- chown root:www-data /var/www/html
+   kubectl -n xenforo exec "$POD" -c php-fpm -- chmod 2775 /var/www/html
    ```
 
    For 2.3.13 that derives 20 entries — `admin.php`, `cmd.php`, `connected_account.php`, `css.php`, `embed.php`, `htaccess.txt`, `index.php`, `install`, `job.php`, `js`, `library`, `oembed.php`, `payment_callback.php`, `proxy.php`, `service_worker.js`, `sitemap.php`, `src`, `styles`, `unfurl.php`, `webmanifest.php`.
@@ -575,7 +582,19 @@ EOF
 
    That reading predates the policy change, and it is the evidence for it. The volume root was still owned by the *workstation* uid that `kubectl cp` left — `UNKNOWN` because no such user exists in the container — while its group was `www-data`. That combination is only what `chown(-1, fsGroup)` produces: uid untouched, gid forced to 82. So the group-write on code was never "how the install was seeded"; it was re-created on every mount, which also explains why the `drwxr-xr-x 502 wheel` recorded right after the 2.3.13 extract was not what the tree read by then. (That the volume root alone kept the foreign uid is the derived `$CODE` list behaving as designed — `.` was never in it.)
 
-   **Run the block for both halves now, with two caveats.** `chown` was always the half that persisted — `fsGroup` never touches uid, and it sets exactly the gid the code rule wants anyway — and the modes persist too now. First caveat: the policy stops kubelet *re-loosening* a mode, it does not tighten one, so the `664`/`2775` already on the volume stay exactly that until this block runs. Second: the same policy is what makes the init container's `chown -R 82:82` of `internal_data`, `data` and `src/addons` load-bearing rather than belt-and-braces, because nothing else grants php-fpm write access any more — do not remove it. The other candidate was dropping `fsGroup` and leaving ownership entirely to that init container; `OnRootMismatch` won because a fresh PVC still gets its one full walk (its root is neither gid 82 nor setgid, so the first mount mismatches), which is what seeding a new volume wants. Either way it is a deliberate change to how a live forum's volume is owned, made on its own with a Velero snapshot in hand rather than folded into an upgrade.
+   **Run the block for all three sets now, with three caveats.** `chown` was always the half that persisted — `fsGroup` never touches uid, and it sets exactly the gid the code rule wants anyway — and the modes persist too now. First caveat: the policy stops kubelet *re-loosening* a mode, it does not tighten one, so the `664`/`2775` already on the volume stay exactly that until this block runs. Second: the same policy is what makes the init container's `chown -R 82:82` of `internal_data`, `data` and `src/addons` load-bearing rather than belt-and-braces, because nothing else grants php-fpm write access any more — do not remove it. The other candidate was dropping `fsGroup` and leaving ownership entirely to that init container; `OnRootMismatch` won because a fresh PVC still gets its one full walk (its root is neither gid 82 nor setgid, so the first mount mismatches), which is what seeding a new volume wants. Either way it is a deliberate change to how a live forum's volume is owned, made on its own with a Velero snapshot in hand rather than folded into an upgrade.
+
+   Third, and this is the one that bites: **a mismatched volume root undoes everything above, at the restart in step 6, silently.** The extract resets `/var/www/html` itself — the archive's `./` entry carries the workstation's uid, gid and mode, and busybox `tar` running as root restores all three, which is exactly why the tree read `drwxr-xr-x 502 wheel` after the 2.3.13 extract. `$CODE` never contains `.`, so before the root repair above was added, nothing fixed it. Under the old default policy that cost nothing, because the walk ran regardless and put the root back itself; under `OnRootMismatch` a root at `755` with gid `20` is a mismatch on all three counts, so the walk runs one more time and re-loosens the whole tree. Verify it before moving on:
+
+   ```bash
+   ROOT_STAT=$(kubectl -n xenforo exec "$POD" -c php-fpm -- stat -c '%a %G' /var/www/html) \
+     || { echo "FATAL: could not stat the volume root" >&2; exit 1; }
+   echo "volume root: $ROOT_STAT"
+   [ "$ROOT_STAT" = "2775 www-data" ] \
+     || { echo "FATAL: the root does not match fsGroup — the next mount will re-walk the volume and undo every mode above" >&2; exit 1; }
+   ```
+
+   `2775` is not a free choice. Kubelet skips the walk only when the root's group bits already cover `0770` (`rwMask | execMask`), so the root directory itself has to be group-writable — which means `www-data` can rename or replace a top-level entry. That is unchanged from today, because group-write on the root is what the walk had been setting all along, and it stops at that one directory.
 
    `COPYFILE_DISABLE=1` is a macOS detail: without it `tar` embeds AppleDouble xattrs and busybox in the pod prints one `Ignoring unknown extended header keyword` line per file, burying any real error in thousands of lines of noise.
 
